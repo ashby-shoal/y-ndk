@@ -50,7 +50,8 @@ export async function createNostrCRDTRoom (
         tags: [['crdt', label]],
         content: toBase64(encrypt(initialLocalState))
       })
-      ndk.publish(event)
+      event.publish()
+      // ndk.publish(event)
     }
 
     if (secretNostrKey !== undefined) {
@@ -109,14 +110,15 @@ export class NostrProvider extends ObservableV2 {
     return update
   }
 
-  publishUpdate (update) {
+  async publishUpdate (update) {
     if (this.secretNostrKey === undefined) {
       const event = new NDKEvent(this.ndk, {
         kind: this.YJS_UPDATE_EVENT_KIND,
         tags: [['e', this.nostrRoomCreateEventId]],
         content: toBase64(this.encrypt(update))
       })
-      this.ndk.publish(event)
+      await event.publish()
+      // this.ndk.publish(event)
     }
 
     if (this.secretNostrKey !== undefined) {
