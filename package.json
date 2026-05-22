@@ -1,6 +1,6 @@
 {
-  "name": "@colealbon/y-ndk",
-  "version": "0.0.1",
+  "name": "@ashby-shoal/y-ndk",
+  "version": "0.0.2",
   "description": "yjs crdt state synchronizors over nostr relays",
   "exports": {
     "./package.json": "./package.json",
@@ -40,7 +40,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/colealbon/y-ndk.git"
+    "url": "git+https://github.com/ashby-shoal/y-ndk.git"
   },
   "keywords": [
     "yjs",
@@ -49,8 +49,5 @@
   ],
   "author": "Cole Albon",
   "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/colealbon/y-ndk/issues"
-  },
-  "homepage": "https://github.com/colealbon/y-ndk#readme"
+  "homepage": "https://github.com/ashby-shoal/y-ndk#readme"
 }
