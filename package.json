@@ -1,6 +1,6 @@
 {
   "name": "@ashby-shoal/y-ndk",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "yjs crdt state synchronizors over nostr relays",
   "exports": {
     "./package.json": "./package.json",
@@ -17,7 +17,7 @@
     "@rollup/plugin-commonjs": "^25.0.8",
     "crypto-js": "^4.2.0",
     "nostr-tools": "^2.23.5",
-    "rollup": "^4.60.4",
+    "rollup": "^4.61.0",
     "standard": "^17.1.2"
   },
   "browser": {
@@ -30,7 +30,7 @@
     "websocket-polyfill": "^1.0.0",
     "ws": "^8.21.0",
     "y-protocols": "^1.0.7",
-    "yjs": "^13.6.30"
+    "yjs": "^13.6.31"
   },
   "main": "index.js",
   "directories": {
