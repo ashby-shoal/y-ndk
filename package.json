@@ -16,8 +16,8 @@
   "devDependencies": {
     "@rollup/plugin-commonjs": "^25.0.8",
     "crypto-js": "^4.2.0",
-    "nostr-tools": "^2.23.5",
-    "rollup": "^4.61.0",
+    "nostr-tools": "^2.23.8",
+    "rollup": "^4.62.2",
     "standard": "^17.1.2"
   },
   "browser": {
