@@ -14,7 +14,7 @@ update to the venerable [nostr-crdt](https://github.com/YousefED/nostr-crdt) pac
 
 ## install
 ```sh
-npm install @colealbon/y-ndk
+npm install /y-ndk
 ```
 
 ## example usage
@@ -26,8 +26,8 @@ npm install @colealbon/y-ndk
 
 ## develop
 
-```sh
-git clone https://github.com/colealbon/y-ndk.git;
+```https://github.com/ashby-shoal/y-ndk.git
+git clone https://github.com/ashby-shoal/y-ndk.git;
 cd y-ndk;
 pnpm install;
 pnpm run test-cleartext; sleep 2; pnpm run test-private
@@ -43,6 +43,7 @@ ndk-cli: [https://github.com/nostr-dev-kit/ndk-cli](https://github.com/nostr-dev
 y-webrtc: [https://github.com/yjs/y-webrtc](https://github.com/yjs/y-webrtc)  
 ssb-box: [https://github.com/ssbc/ssb-box](https://github.com/ssbc/ssb-box)  
 private-box: [https://github.com/auditdrivencrypto/private-box](https://github.com/auditdrivencrypto/private-box)  
+
 
 ## the future
 we anticipate a client will pass in modern encrypt/decrypt functions - like whatever solidifies from this discussion:  

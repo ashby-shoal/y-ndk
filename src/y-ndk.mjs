@@ -1,23 +1,13 @@
-import { ObservableV2 } from 'lib0/observable'
-import {
-  toBase64,
-  fromBase64
-} from 'lib0/buffer'
-import {
-  NDKEvent
-} from '@nostr-dev-kit/ndk'
-import {
-  arrayBuffersAreEqual,
-  snapshotContainsAllDeletes
-} from './util.mjs'
-import { finalizeEvent, verifyEvent } from 'nostr-tools/pure'
-import { SimplePool } from 'nostr-tools/pool'
+import { ObservableV2 } from "lib0/observable";
+import { toBase64, fromBase64 } from "lib0/buffer";
+import { NDKEvent } from "@nostr-dev-kit/ndk";
+import { arrayBuffersAreEqual, snapshotContainsAllDeletes } from "./util.mjs";
+import { finalizeEvent, verifyEvent } from "nostr-tools/pure";
+import { SimplePool } from "nostr-tools/pool";
 
-const pool = new SimplePool()
+const pool = new SimplePool();
 
-export async function createNostrCRDTRoom (
-  params
-) {
+export async function createNostrCRDTRoom(params) {
   // plagiarized from:
   // https://github.com/YousefED/nostr-crdt/blob/main/packages/nostr-crdt/src/createNostrCRDTRoom.ts
   const {
@@ -27,51 +17,56 @@ export async function createNostrCRDTRoom (
     YJS_UPDATE_EVENT_KIND,
     secretNostrKey,
     explicitRelayUrls,
-    encrypt
+    encrypt,
   } = {
     encrypt: (passthrough) => passthrough,
-    ...params
-  }
+    ...params,
+  };
 
   return new Promise((resolve) => {
-    const sub = ndk.subscribe({
-      since: Math.floor(Date.now() / 1000) - 1,
-      kinds: [YJS_UPDATE_EVENT_KIND]
-    }, {
-      closeOnEose: true
-    })
-    sub.on('event', (event) => {
-      resolve(event.id)
-    })
+    const sub = ndk.subscribe(
+      {
+        since: Math.floor(Date.now() / 1000) - 1,
+        kinds: [YJS_UPDATE_EVENT_KIND],
+      },
+      {
+        closeOnEose: true,
+      },
+    );
+    sub.on("event", (event) => {
+      resolve(event.id);
+    });
 
     if (secretNostrKey === undefined) {
       const event = new NDKEvent(ndk, {
         kind: YJS_UPDATE_EVENT_KIND,
-        tags: [['crdt', label]],
-        content: toBase64(encrypt(initialLocalState))
-      })
-      event.publish()
+        tags: [["crdt", label]],
+        content: toBase64(encrypt(initialLocalState)),
+      });
+      event.publish();
       // ndk.publish(event)
     }
 
     if (secretNostrKey !== undefined) {
-      ndk.signer.user().then(theUser => {
-        const signedEvent = finalizeEvent({
-          kind: YJS_UPDATE_EVENT_KIND,
-          created_at: Math.floor(Date.now() / 1000),
-          tags: [['crdt', label]],
-          content: toBase64(encrypt(initialLocalState))
-        }, secretNostrKey)
-        verifyEvent(signedEvent) && pool.publish(explicitRelayUrls, signedEvent)
-      })
+      ndk.signer.user().then((theUser) => {
+        const signedEvent = finalizeEvent(
+          {
+            kind: YJS_UPDATE_EVENT_KIND,
+            created_at: Math.floor(Date.now() / 1000),
+            tags: [["crdt", label]],
+            content: toBase64(encrypt(initialLocalState)),
+          },
+          secretNostrKey,
+        );
+        verifyEvent(signedEvent) &&
+          pool.publish(params.explicitRelayUrls, signedEvent);
+      });
     }
-  })
+  });
 }
 
 export class NostrProvider extends ObservableV2 {
-  constructor (
-    params
-  ) {
+  constructor(params) {
     const {
       yjs,
       ydoc,
@@ -81,168 +76,170 @@ export class NostrProvider extends ObservableV2 {
       secretNostrKey,
       explicitRelayUrls,
       encrypt,
-      decrypt
+      decrypt,
     } = {
       encrypt: (passthrough) => passthrough,
       decrypt: (passthrough) => passthrough,
-      ...params
-    }
+      ...params,
+    };
 
-    super()
-    this.yjs = yjs
-    this.ydoc = ydoc
-    this.ndk = ndk
-    this.nostrRoomCreateEventId = nostrRoomCreateEventId
-    this.ydoc.on('update', (update, origin) => {
-      this.documentUpdateListener(update, origin)
-    })
-    this.YJS_UPDATE_EVENT_KIND = YJS_UPDATE_EVENT_KIND
-    this.secretNostrKey = secretNostrKey
-    this.explicitRelayUrls = explicitRelayUrls
-    this.encrypt = encrypt
-    this.decrypt = decrypt
+    super();
+    this.yjs = yjs;
+    this.ydoc = ydoc;
+    this.ndk = ndk;
+    this.nostrRoomCreateEventId = nostrRoomCreateEventId;
+    this.ydoc.on("update", (update, origin) => {
+      this.documentUpdateListener(update, origin);
+    });
+    this.YJS_UPDATE_EVENT_KIND = YJS_UPDATE_EVENT_KIND;
+    this.secretNostrKey = secretNostrKey;
+    this.explicitRelayUrls = explicitRelayUrls;
+    this.encrypt = encrypt;
+    this.decrypt = decrypt;
   }
 
-  updateFromEvents (events) {
-    let updates = null
-    updates = events.map((e) => this.decrypt(fromBase64(e.content)))
-    const update = this.yjs.mergeUpdates(updates)
-    return update
+  updateFromEvents(events) {
+    let updates = null;
+    updates = events.map((e) => this.decrypt(fromBase64(e.content)));
+    const update = this.yjs.mergeUpdates(updates);
+    return update;
   }
 
-  async publishUpdate (update) {
+  async publishUpdate(update) {
     if (this.secretNostrKey === undefined) {
       const event = new NDKEvent(this.ndk, {
         kind: this.YJS_UPDATE_EVENT_KIND,
-        tags: [['e', this.nostrRoomCreateEventId]],
-        content: toBase64(this.encrypt(update))
-      })
-      await event.publish()
+        tags: [["e", this.nostrRoomCreateEventId]],
+        content: toBase64(this.encrypt(update)),
+      });
+      await event.publish();
       // this.ndk.publish(event)
     }
 
     if (this.secretNostrKey !== undefined) {
-      this.ndk.signer.user().then(theUser => {
-        const signedEvent = finalizeEvent({
-          kind: this.YJS_UPDATE_EVENT_KIND,
-          created_at: Math.floor(Date.now() / 1000),
-          tags: [['e', this.nostrRoomCreateEventId]],
-          content: toBase64(this.encrypt(update))
-        }, this.secretNostrKey)
-        verifyEvent(signedEvent) && pool.publish(this.explicitRelayUrls, signedEvent)
-      })
+      this.ndk.signer.user().then((theUser) => {
+        const signedEvent = finalizeEvent(
+          {
+            kind: this.YJS_UPDATE_EVENT_KIND,
+            created_at: Math.floor(Date.now() / 1000),
+            tags: [["e", this.nostrRoomCreateEventId]],
+            content: toBase64(this.encrypt(update)),
+          },
+          this.secretNostrKey,
+        );
+        verifyEvent(signedEvent) &&
+          pool.publish(this.explicitRelayUrls, signedEvent);
+      });
     }
   }
 
-  pendingUpdates = []
-  sendPendingTimeout
+  pendingUpdates = [];
+  sendPendingTimeout;
 
-  async documentUpdateListener (update, origin) {
+  async documentUpdateListener(update, origin) {
     // https://discuss.yjs.dev/t/how-to-distinguish-which-user-triggered-this-update/2584
     if (origin === this) {
-      return
+      return;
     }
     if (origin?.provider) {
-      return
+      return;
     }
-    this?.pendingUpdates.push(update)
+    this?.pendingUpdates.push(update);
 
     if (this?.sendPendingTimeout) {
-      clearTimeout(this.sendPendingTimeout)
+      clearTimeout(this.sendPendingTimeout);
     }
 
     // buffer every 100ms
     if (this === undefined) {
-      return
+      return;
     }
     this.sendPendingTimeout = setTimeout(() => {
-      this.publishUpdate(this.yjs.mergeUpdates(this.pendingUpdates))
-      this.pendingUpdates = []
-    }, 100)
+      this.publishUpdate(this.yjs.mergeUpdates(this.pendingUpdates));
+      this.pendingUpdates = [];
+    }, 100);
   }
 
   /**
-  * Handles incoming events from nostr
-  */
+   * Handles incoming events from nostr
+   */
   processIncomingEvents = (events) => {
-    const update = this.updateFromEvents(events)
+    const update = this.updateFromEvents(events);
     if (update === undefined) {
-      return
+      return;
     }
-    this.yjs.applyUpdate(this.ydoc, update, this)
-  }
+    this.yjs.applyUpdate(this.ydoc, update, this);
+  };
 
-  async initialize () {
+  async initialize() {
     try {
-      let eoseSeen = false
-      const initialEvents = []
+      let eoseSeen = false;
+      const initialEvents = [];
       const sub = this.ndk.subscribe(
         {
           kinds: [this.YJS_UPDATE_EVENT_KIND],
           // limit: 1,
           since: 0,
-          '#e': [this.nostrRoomCreateEventId]
+          "#e": [this.nostrRoomCreateEventId],
         },
-        { closeOnEose: false }
-      )
-      sub.on('event', (e) => {
+        { closeOnEose: false },
+      );
+      sub.on("event", (e) => {
         if (!eoseSeen) {
-          initialEvents.push(e)
+          initialEvents.push(e);
         } else {
-          this.processIncomingEvents([e])
+          this.processIncomingEvents([e]);
         }
-      })
-      sub.on('events', (es) => {
-        this.processIncomingEvents(es)
-      })
-      sub.on('eose', () => {
-        eoseSeen = true
-        const initialLocalState = this.yjs.encodeStateAsUpdate(this.ydoc)
-        const initialLocalStateVector = this.yjs.encodeStateVectorFromUpdate(initialLocalState)
+      });
+      sub.on("events", (es) => {
+        this.processIncomingEvents(es);
+      });
+      sub.on("eose", () => {
+        eoseSeen = true;
+        const initialLocalState = this.yjs.encodeStateAsUpdate(this.ydoc);
+        const initialLocalStateVector =
+          this.yjs.encodeStateVectorFromUpdate(initialLocalState);
         const deleteSetOnlyUpdate = this.yjs.diffUpdate(
           initialLocalState,
-          initialLocalStateVector
-        )
-        const oldSnapshot = this.yjs.snapshot(this.ydoc)
+          initialLocalStateVector,
+        );
+        const oldSnapshot = this.yjs.snapshot(this.ydoc);
         // This can fail because of no access to room. Because the room history should always be available,
         // we don't catch this event here
-        const update = this.updateFromEvents(initialEvents)
+        const update = this.updateFromEvents(initialEvents);
         if (initialEvents?.length > 0) {
-          this.yjs.applyUpdate(this.ydoc, update, this)
+          this.yjs.applyUpdate(this.ydoc, update, this);
         }
 
         // this.emit('documentAvailable') <-- this breaks stuff, don't know why, y-nkd seems to work without
         // Next, find if there are local changes that haven't been synced to the server
-        const remoteStateVector = this.yjs.encodeStateVectorFromUpdate(update)
+        const remoteStateVector = this.yjs.encodeStateVectorFromUpdate(update);
         const missingOnWire = this.yjs.diffUpdate(
           initialLocalState,
-          remoteStateVector
-        )
+          remoteStateVector,
+        );
         // missingOnWire will always contain the entire deleteSet on startup.
         // Unfortunately diffUpdate doesn't work well with deletes. In the if-statement
         // below, we try to detect when missingOnWire only contains the deleteSet, with
         // deletes that already exist on the wire
         if (
-          arrayBuffersAreEqual(
-            deleteSetOnlyUpdate.buffer,
-            missingOnWire.buffer
-          )
+          arrayBuffersAreEqual(deleteSetOnlyUpdate.buffer, missingOnWire.buffer)
         ) {
           // TODO: instead of next 3 lines, we can probably get deleteSet directly from 'update'
-          const serverDoc = new this.yjs.Doc()
-          this.yjs.applyUpdate(serverDoc, update)
-          const serverSnapshot = this.yjs.snapshot(serverDoc)
+          const serverDoc = new this.yjs.Doc();
+          this.yjs.applyUpdate(serverDoc, update);
+          const serverSnapshot = this.yjs.snapshot(serverDoc);
           // TODO: could also compare whether snapshot equal? instead of snapshotContainsAllDeletes?
           if (snapshotContainsAllDeletes(serverSnapshot, oldSnapshot)) {
             // missingOnWire only contains a deleteSet with items that are already in the deleteSet on server
           }
         }
         if (missingOnWire.length > 2) {
-          this.publishUpdate(missingOnWire)
+          this.publishUpdate(missingOnWire);
         }
-      })
+      });
     } catch (e) {
-      console.error(e)
+      console.error(e);
     }
   }
 }

@@ -5,9 +5,11 @@ import * as yjs from "yjs";
 import NDK, { NDKPrivateKeySigner } from "@nostr-dev-kit/ndk";
 import { NostrProvider, createNostrCRDTRoom } from "../src/y-ndk.mjs";
 import { YJS_UPDATE_EVENT_KIND } from "./magic.mjs";
-import chloride from "chloride";
-import box from "private-box";
-
+// import chloride from "chloride";
+// import box from "private-box";
+// we need to fix this to use age
+//
+//
 global.WebSocket = WebSocket;
 const TEST_NOSTR_RELAYS = ["http://localhost:3334"];
 
