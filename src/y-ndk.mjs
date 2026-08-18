@@ -1,7 +1,3 @@
-// plagiarized from:
-// https://github.com/YousefED/nostr-crdt/blob/main/packages/nostr-crdt/src/createNostrCRDTRoom.ts
-// NostrProvider with conservative D1/Nosflare-safe chunked updates.
-//
 // Based on:
 // https://github.com/YousefED/nostr-crdt/blob/main/packages/nostr-crdt/src/createNostrCRDTRoom.ts
 //
@@ -977,9 +973,9 @@ export class NostrProvider extends ObservableV2 {
               this.YJS_UPDATE_EVENT_KIND,
             ],
             since: 0,
-            "#e": [
-              this.nostrRoomCreateEventId,
-            ],
+            // "#e": [
+            //   this.nostrRoomCreateEventId,
+            // ],
           },
           {
             closeOnEose: false,
@@ -989,6 +985,12 @@ export class NostrProvider extends ObservableV2 {
       sub.on(
         "event",
         (event) => {
+          console.log("NOSTR EVENT RECEIVED", {
+            id: event.id,
+            kind: event.kind,
+            tags: event.tags,
+            contentLength: event.content?.length,
+          });
           if (!eoseSeen) {
             initialEvents.push(
               event,
