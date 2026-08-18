@@ -661,6 +661,7 @@ export class NostrProvider extends ObservableV2 {
    * Process one incoming Nostr event.
    */
   processIncomingEvent = (event) => {
+    console.log("[YJS] PROCESSING EVENT", event.id);
     const chunkTag =
       event.tags?.find(
         (tag) => tag[0] === "chunk",
@@ -804,6 +805,11 @@ export class NostrProvider extends ObservableV2 {
     }
 
     try {
+      console.log("[YJS] COMPLETE CHUNK BATCH", {
+        batchId,
+        total: batch.total,
+        received: batch.received,
+      });
       /**
        * All chunks are available.
        *
