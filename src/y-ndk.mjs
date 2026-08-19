@@ -160,7 +160,8 @@ async function publishEvent({
 
     return event;
   }
-
+  console.log(eventTemplate)
+  console.log(secretNostrKey)
   const signedEvent = finalizeEvent(
     eventTemplate,
     secretNostrKey,
@@ -977,6 +978,7 @@ export class NostrProvider extends ObservableV2 {
             kinds: [
               this.YJS_UPDATE_EVENT_KIND,
             ],
+            "#e": [this.nostrRoomCreateEventId],
           },
           {
             closeOnEose: false,
