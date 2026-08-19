@@ -54,6 +54,18 @@ function normalizeDecryptedValue(value) {
   return toUint8Array(value);
 }
 
+/*
+ * Encryption remains completely controlled by the encrypt() callback.
+ *
+ * The callback returns:
+ *
+ *   {
+ *     data: Uint8Array,
+ *     encrypted: boolean
+ *   }
+ *
+ * The provider does not know how encryption works.
+ */
 function getEncryptionTag(encrypted) {
   return encrypted ? [ENC_TAG_NAME, ENC_AGE] : undefined;
 }
@@ -151,23 +163,16 @@ function createChunkTag(batchId, index, total) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Encryption contract                                                        */
+/* Encryption callbacks                                                       */
 /* -------------------------------------------------------------------------- */
 
-/*
- * encrypt() MUST return:
- *
- *   {
- *     data: Uint8Array,
- *     encrypted: boolean
- *   }
- *
- * This is deliberately strict. A raw Uint8Array cannot tell the provider
- * whether the bytes are plaintext or ciphertext, so accepting one would
- * make it possible to publish plaintext with an enc=age tag.
- */
-
 async function runEncrypt(encrypt, input) {
+  if (typeof encrypt !== "function") {
+    throw new Error(
+      "[YJS] encrypt() function is not configured",
+    );
+  }
+
   const result = await encrypt(input);
 
   if (
@@ -200,7 +205,10 @@ async function runDecrypt(
   encrypted,
 ) {
   /*
-   * Plaintext events must never be sent through the age decrypter.
+   * Encryption/decryption is owned entirely by the callback supplied
+   * by the caller.
+   *
+   * For plaintext events, there is nothing to decrypt.
    */
   if (!encrypted) {
     return toUint8Array(input);
@@ -212,6 +220,13 @@ async function runDecrypt(
     );
   }
 
+  /*
+   * IMPORTANT:
+   *
+   * Do not pass identities, recipients, keys, configuration, or context.
+   *
+   * The callback is responsible for all of that through its closure.
+   */
   const result = await decrypt(input);
 
   if (result == null) {
@@ -429,10 +444,18 @@ export class NostrProvider extends ObservableV2 {
       YJS_UPDATE_EVENT_KIND,
       secretNostrKey,
       explicitRelayUrls,
+
+      /*
+       * ONLY callbacks cross the y-ndk boundary.
+       *
+       * Any encryption state, age identities, recipients, keys,
+       * or other crypto configuration belongs to the caller.
+       */
       encrypt = async (value) => ({
         data: value,
         encrypted: false,
       }),
+
       decrypt = async (value) => value,
     } = params;
 
