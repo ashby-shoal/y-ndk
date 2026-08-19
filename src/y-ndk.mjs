@@ -574,19 +574,20 @@ export class NostrProvider extends ObservableV2 {
 
   async updateFromEvents(events) {
     const updates = [];
+    let skipped = 0;
 
     for (const event of events) {
       try {
-        const update =
-          await this.decodeEvent(event);
+        const update = await this.decodeEvent(event);
 
         if (update == null) {
+          skipped++;
           continue;
         }
 
         if (update.byteLength === 0) {
           console.warn(
-            "[YJS] Ignoring empty decrypted update",
+            "[YJS] Ignoring empty decoded update",
           );
           continue;
         }
@@ -602,6 +603,25 @@ export class NostrProvider extends ObservableV2 {
         );
       }
     }
+
+    if (updates.length === 0) {
+      if (events.length > 0) {
+        console.warn(
+          "[YJS] No initial events could be decoded",
+          {
+            received: events.length,
+            skipped,
+          },
+        );
+      }
+
+      return undefined;
+    }
+
+    return toUint8Array(
+      this.yjs.mergeUpdates(updates),
+    );
+  }
 
     if (updates.length === 0) {
       return undefined;
