@@ -22,7 +22,7 @@ const pool = new SimplePool();
  * - encryption overhead
  * - relay/proxy overhead
  */
-const NOSTR_UPDATE_CHUNK_BYTES = 32 * 1024;
+const NOSTR_UPDATE_CHUNK_BYTES = 128 * 1024;
 
 /**
  * How long incomplete chunk batches remain in memory.
