@@ -141,11 +141,7 @@ function splitUpdatesIntoChunks(
   return chunks;
 }
 
-function createChunkTag(
-  batchId,
-  index,
-  total,
-) {
+function createChunkTag(batchId, index, total) {
   return [
     "chunk",
     batchId,
@@ -159,51 +155,42 @@ function createChunkTag(
 /* -------------------------------------------------------------------------- */
 
 /*
- * Encryption is deliberately event-aware.
- *
- * encrypt() may return:
+ * encrypt() MUST return:
  *
  *   {
  *     data: Uint8Array,
- *     encrypted: true
+ *     encrypted: boolean
  *   }
  *
- * or:
- *
- *   {
- *     data: Uint8Array,
- *     encrypted: false
- *   }
- *
- * A raw Uint8Array is also accepted for backwards compatibility and is
- * treated as encrypted because older callers cannot communicate metadata.
+ * This is deliberately strict. A raw Uint8Array cannot tell the provider
+ * whether the bytes are plaintext or ciphertext, so accepting one would
+ * make it possible to publish plaintext with an enc=age tag.
  */
 
 async function runEncrypt(encrypt, input) {
   const result = await encrypt(input);
 
-  if (result == null) {
+  if (
+    !result ||
+    typeof result !== "object" ||
+    !("data" in result)
+  ) {
     throw new Error(
-      "[YJS] encrypt() returned null/undefined",
+      "[YJS] encrypt() must return { data, encrypted }",
     );
   }
 
-  if (
-    result &&
-    typeof result === "object" &&
-    "data" in result
-  ) {
-    const data = toUint8Array(result.data);
+  const data = toUint8Array(result.data);
 
-    return {
-      data,
-      encrypted: result.encrypted === true,
-    };
+  if (data.byteLength === 0) {
+    throw new Error(
+      "[YJS] encrypt() returned empty data",
+    );
   }
 
   return {
-    data: toUint8Array(result),
-    encrypted: true,
+    data,
+    encrypted: result.encrypted === true,
   };
 }
 
@@ -214,16 +201,34 @@ async function runDecrypt(
 ) {
   /*
    * Plaintext events must never be sent through the age decrypter.
-   *
-   * This is the key difference from the previous implementation.
    */
   if (!encrypted) {
     return toUint8Array(input);
   }
 
+  if (typeof decrypt !== "function") {
+    throw new Error(
+      "[YJS] Received encrypted event but no decrypt() function is configured",
+    );
+  }
+
   const result = await decrypt(input);
 
-  return normalizeDecryptedValue(result);
+  if (result == null) {
+    throw new Error(
+      "[YJS] decrypt() returned null/undefined",
+    );
+  }
+
+  const output = normalizeDecryptedValue(result);
+
+  if (output.byteLength === 0) {
+    throw new Error(
+      "[YJS] decrypt() returned empty data",
+    );
+  }
+
+  return output;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -490,19 +495,38 @@ export class NostrProvider extends ObservableV2 {
   async decodeEvent(event) {
     const encoded = fromBase64(event.content);
 
-    /*
-     * The event itself determines whether the content is encrypted.
-     *
-     * No enc tag = plaintext.
-     * enc=age = age ciphertext.
-     */
-    const encrypted = hasAgeEncryptionTag(event);
+    const encrypted =
+      hasAgeEncryptionTag(event);
 
-    return runDecrypt(
+    console.log(
+      "[YJS] Decoding event",
+      {
+        id: event.id,
+        encrypted,
+        contentBytes: encoded.byteLength,
+        tags: event.tags,
+      },
+    );
+
+    const update = await runDecrypt(
       this.decrypt,
       encoded,
       encrypted,
     );
+
+    console.log(
+      "[YJS] Decoded event",
+      {
+        id: event.id,
+        encrypted,
+        updateBytes: update.byteLength,
+        firstBytes: Array.from(
+          update.slice(0, 16),
+        ),
+      },
+    );
+
+    return update;
   }
 
   async updateFromEvents(events) {
@@ -510,7 +534,8 @@ export class NostrProvider extends ObservableV2 {
 
     for (const event of events) {
       try {
-        const update = await this.decodeEvent(event);
+        const update =
+          await this.decodeEvent(event);
 
         if (update.byteLength === 0) {
           console.warn(
@@ -523,7 +548,10 @@ export class NostrProvider extends ObservableV2 {
       } catch (error) {
         console.error(
           "[YJS] Failed to decode/decrypt event:",
-          error,
+          {
+            eventId: event?.id,
+            error,
+          },
         );
       }
     }
@@ -532,9 +560,31 @@ export class NostrProvider extends ObservableV2 {
       return undefined;
     }
 
-    return toUint8Array(
-      this.yjs.mergeUpdates(updates),
-    );
+    try {
+      return toUint8Array(
+        this.yjs.mergeUpdates(updates),
+      );
+    } catch (error) {
+      console.error(
+        "[YJS] mergeUpdates() failed",
+        {
+          updateCount: updates.length,
+          updateSizes: updates.map(
+            (update) =>
+              update.byteLength,
+          ),
+          firstBytes: updates.map(
+            (update) =>
+              Array.from(
+                update.slice(0, 32),
+              ),
+          ),
+          error,
+        },
+      );
+
+      throw error;
+    }
   }
 
   /* ------------------------------------------------------------------------ */
@@ -590,12 +640,6 @@ export class NostrProvider extends ObservableV2 {
         this.encrypt,
         chunk,
       );
-
-      if (encrypted.data.byteLength === 0) {
-        throw new Error(
-          "[YJS] Encryption produced empty data",
-        );
-      }
 
       const content = toBase64(
         encrypted.data,
@@ -763,7 +807,10 @@ export class NostrProvider extends ObservableV2 {
       } catch (error) {
         console.error(
           "[YJS] Failed to process incoming Yjs event:",
-          error,
+          {
+            eventId: event?.id,
+            error,
+          },
         );
       }
 
@@ -838,7 +885,10 @@ export class NostrProvider extends ObservableV2 {
     } catch (error) {
       console.error(
         "[YJS] Failed to decode/decrypt incoming chunk:",
-        error,
+        {
+          eventId: event?.id,
+          error,
+        },
       );
       return;
     }
@@ -899,7 +949,10 @@ export class NostrProvider extends ObservableV2 {
     } catch (error) {
       console.error(
         "[YJS] Failed to reassemble Yjs chunk batch:",
-        error,
+        {
+          batchId,
+          error,
+        },
       );
 
       this.chunkBuffer.delete(
@@ -1131,10 +1184,21 @@ export class NostrProvider extends ObservableV2 {
             usableInitialEvents.length >
             0
           ) {
-            update =
-              await this.updateFromEvents(
-                usableInitialEvents,
-              );
+            try {
+              update =
+                await this.updateFromEvents(
+                  usableInitialEvents,
+                );
+            } catch (error) {
+              if (!this.destroyed) {
+                console.error(
+                  "[YJS] Failed to construct initial Yjs update:",
+                  error,
+                );
+              }
+
+              return;
+            }
 
             if (
               update !== undefined &&

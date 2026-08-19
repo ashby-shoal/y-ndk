@@ -1,6 +1,6 @@
 {
   "name": "@ashby-shoal/y-ndk",
-  "version": "0.0.19",
+"version": "0.0.20",
   "description": "yjs crdt state synchronizors over nostr relays",
   "exports": {
     "./package.json": "./package.json",
