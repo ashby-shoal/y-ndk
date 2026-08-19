@@ -557,6 +557,25 @@ export class NostrProvider extends ObservableV2 {
       encrypted,
     );
 
+    /*
+     * An encrypted event can legitimately be unavailable to this
+     * client when no decrypt() function was configured.
+     *
+     * y-ndk does not know anything about identities, recipients,
+     * age keys, or encryption configuration.
+     */
+    if (update == null) {
+      console.warn(
+        "[YJS] Event could not be decoded by this client",
+        {
+          id: event.id,
+          encrypted,
+        },
+      );
+
+      return undefined;
+    }
+
     console.log(
       "[YJS] Decoded event",
       {
@@ -574,20 +593,25 @@ export class NostrProvider extends ObservableV2 {
 
   async updateFromEvents(events) {
     const updates = [];
-    let skipped = 0;
 
     for (const event of events) {
       try {
-        const update = await this.decodeEvent(event);
+        const update =
+          await this.decodeEvent(event);
 
+        /*
+         * undefined means this client could not decode the event.
+         *
+         * This is expected for an encrypted event when the current
+         * client has no decrypt() function configured.
+         */
         if (update == null) {
-          skipped++;
           continue;
         }
 
         if (update.byteLength === 0) {
           console.warn(
-            "[YJS] Ignoring empty decoded update",
+            "[YJS] Ignoring empty decrypted update",
           );
           continue;
         }
@@ -602,29 +626,6 @@ export class NostrProvider extends ObservableV2 {
           },
         );
       }
-    }
-
-    if (updates.length === 0) {
-      if (events.length > 0) {
-        console.warn(
-          "[YJS] No initial events could be decoded",
-          {
-            received: events.length,
-            skipped,
-          },
-        );
-      }
-
-      return undefined;
-    }
-
-    return toUint8Array(
-      this.yjs.mergeUpdates(updates),
-    );
-  }
-
-    if (updates.length === 0) {
-      return undefined;
     }
 
     try {
@@ -933,106 +934,91 @@ export class NostrProvider extends ObservableV2 {
     }
 
     if (batch.total !== total) {
-      return;
-    }
-
-    if (
-      batch.chunks[index] !==
-      undefined
-    ) {
-      return;
-    }
-
-    try {
-      const update =
-        await this.decodeEvent(event);
-
-      if (update == null) {
-        return;
-      }
-
-      if (update.byteLength === 0) {
-        return;
-      }
-
-      batch.chunks[index] = update;
-      batch.received++;
-    } catch (error) {
-      console.error(
-        "[YJS] Failed to decode/decrypt incoming chunk:",
+      console.warn(
+        "[YJS] Ignoring chunk with mismatched total",
         {
-          eventId: event?.id,
-          error,
+          batchId,
+          expected: batch.total,
+          received: total,
         },
       );
       return;
     }
 
-    if (
-      batch.received !==
-      batch.total
-    ) {
+    if (!batch.chunks[index]) {
+      try {
+        const update =
+          await this.decodeEvent(event);
+
+        if (update == null) {
+          return;
+        }
+
+        if (update.byteLength === 0) {
+          return;
+        }
+
+        batch.chunks[index] = update;
+        batch.received += 1;
+      } catch (error) {
+        console.error(
+          "[YJS] Failed to decode/decrypt incoming chunk:",
+          {
+            eventId: event?.id,
+            error,
+          },
+        );
+
+        return;
+      }
+    }
+
+    if (batch.received !== batch.total) {
       return;
     }
 
+    const chunks = batch.chunks;
+
     if (
-      batch.chunks.some(
+      chunks.some(
         (chunk) =>
-          chunk === undefined,
+          !(chunk instanceof Uint8Array),
       )
     ) {
       return;
     }
 
     try {
-      console.log(
-        "[YJS] COMPLETE CHUNK BATCH",
-        {
-          batchId,
-          total: batch.total,
-          received: batch.received,
-          sizes: batch.chunks.map(
-            (chunk) =>
-              chunk?.byteLength,
-          ),
-        },
-      );
+      const merged =
+        this.yjs.mergeUpdates(chunks);
 
-      const mergedUpdate =
-        this.yjs.mergeUpdates(
-          batch.chunks,
-        );
-
-      if (
-        !mergedUpdate ||
-        mergedUpdate.byteLength === 0
-      ) {
+      if (!(merged instanceof Uint8Array)) {
         throw new Error(
-          "Yjs mergeUpdates() returned an empty update",
+          "[YJS] mergeUpdates() did not return Uint8Array",
         );
       }
 
-      this.chunkBuffer.delete(
-        batchId,
-      );
+      if (merged.byteLength === 0) {
+        return;
+      }
+
+      this.chunkBuffer.delete(batchId);
 
       this.yjs.applyUpdate(
         this.ydoc,
-        mergedUpdate,
+        merged,
         this,
       );
     } catch (error) {
       console.error(
-        "[YJS] Failed to reassemble Yjs chunk batch:",
+        "[YJS] Failed to merge/apply incoming chunks:",
         {
           batchId,
           error,
         },
       );
 
-      this.chunkBuffer.delete(
-        batchId,
-      );
+      this.chunkBuffer.delete(batchId);
     }
   }
 
