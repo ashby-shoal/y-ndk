@@ -1,37 +1,24 @@
+// y-ndk.mjs
+
 import { ObservableV2 } from "lib0/observable";
 import { toBase64, fromBase64 } from "lib0/buffer";
 import { NDKEvent } from "@nostr-dev-kit/ndk";
+import { finalizeEvent, verifyEvent } from "nostr-tools/pure";
+import { SimplePool } from "nostr-tools/pool";
+
 import {
   arrayBuffersAreEqual,
   snapshotContainsAllDeletes,
 } from "./util.mjs";
-import { finalizeEvent, verifyEvent } from "nostr-tools/pure";
-import { SimplePool } from "nostr-tools/pool";
 
 const pool = new SimplePool();
 
-/**
- * Maximum raw Yjs bytes in one Nostr event.
- *
- * 32 KiB becomes approximately 43.7 KiB after base64 encoding.
- *
- * This leaves room for:
- *
- * - event JSON
- * - Nostr tags
- * - encryption overhead
- * - relay/proxy overhead
- */
-const NOSTR_UPDATE_CHUNK_BYTES = 128 * 1024;
+const NOSTR_UPDATE_CHUNK_BYTES = 32 * 1024;
 
-/**
- * How long incomplete chunk batches remain in memory.
- */
-const CHUNK_BUFFER_MAX_AGE = 10 * 60 * 1000;
+/* -------------------------------------------------------------------------- */
+/* Binary helpers                                                             */
+/* -------------------------------------------------------------------------- */
 
-/**
- * Return the byte length of a binary value.
- */
 function getByteLength(value) {
   if (value == null) {
     return 0;
@@ -50,9 +37,6 @@ function getByteLength(value) {
   );
 }
 
-/**
- * Convert binary-like values to Uint8Array.
- */
 function toUint8Array(value) {
   if (value instanceof Uint8Array) {
     return value;
@@ -70,36 +54,44 @@ function toUint8Array(value) {
     );
   }
 
-  return new Uint8Array(value);
-}
-
-/**
- * Validate that a value is a usable Nostr event ID.
- */
-function validateEventId(eventId, name = "event ID") {
-  if (
-    typeof eventId !== "string" ||
-    eventId.length !== 64 ||
-    !/^[0-9a-fA-F]+$/.test(eventId)
-  ) {
+  if (value instanceof Promise) {
     throw new Error(
-      `Invalid ${name}: ${String(eventId)}`,
+      "Encryption/decryption returned a Promise. " +
+        "The provider must await it before converting to Uint8Array.",
     );
   }
 
-  return eventId;
+  return new Uint8Array(value);
 }
 
-/**
- * Split complete Yjs updates into conservative chunks.
- *
- * IMPORTANT:
- *
- * We do not slice individual Yjs updates.
- *
- * If an individual update is larger than the maximum, we throw rather than
- * corrupting it.
- */
+function normalizeDecryptedValue(value) {
+  if (value instanceof Uint8Array) {
+    return value;
+  }
+
+  if (value instanceof ArrayBuffer) {
+    return new Uint8Array(value);
+  }
+
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(
+      value.buffer,
+      value.byteOffset,
+      value.byteLength,
+    );
+  }
+
+  if (typeof value === "string") {
+    return new TextEncoder().encode(value);
+  }
+
+  return toUint8Array(value);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Chunking                                                                   */
+/* -------------------------------------------------------------------------- */
+
 function splitUpdatesIntoChunks(
   yjs,
   updates,
@@ -110,15 +102,15 @@ function splitUpdatesIntoChunks(
   let current = [];
   let currentSize = 0;
 
-  for (const rawUpdate of updates) {
-    const update = toUint8Array(rawUpdate);
-    const size = getByteLength(update);
+  for (const update of updates) {
+    const bytes = toUint8Array(update);
+    const size = bytes.byteLength;
 
     if (size > maxBytes) {
       throw new Error(
         `A single Yjs update is ${size} bytes, which exceeds ` +
           `${maxBytes} bytes. ` +
-          `A Yjs update cannot safely be split by slicing bytes.`,
+          `A single Yjs update cannot safely be split by slicing bytes.`,
       );
     }
 
@@ -127,31 +119,30 @@ function splitUpdatesIntoChunks(
       currentSize + size > maxBytes
     ) {
       chunks.push(
-        yjs.mergeUpdates(current),
+        toUint8Array(
+          yjs.mergeUpdates(current),
+        ),
       );
 
       current = [];
       currentSize = 0;
     }
 
-    current.push(update);
+    current.push(bytes);
     currentSize += size;
   }
 
   if (current.length > 0) {
     chunks.push(
-      yjs.mergeUpdates(current),
+      toUint8Array(
+        yjs.mergeUpdates(current),
+      ),
     );
   }
 
   return chunks;
 }
 
-/**
- * Create chunk metadata.
- *
- * ["chunk", batchId, index, total]
- */
 function createChunkTag(
   batchId,
   index,
@@ -165,144 +156,73 @@ function createChunkTag(
   ];
 }
 
-/**
- * Publish a Nostr event.
- *
- * Supports:
- *
- * - NDK signing
- * - raw nostr-tools signing with a secret key
- */
+/* -------------------------------------------------------------------------- */
+/* Nostr publishing                                                           */
+/* -------------------------------------------------------------------------- */
+
 async function publishEvent({
   ndk,
   explicitRelayUrls,
   secretNostrKey,
   eventTemplate,
 }) {
-  if (!eventTemplate) {
+  if (!eventTemplate.kind) {
     throw new Error(
-      "Cannot publish Nostr event without eventTemplate",
+      "Cannot publish Nostr event without kind",
     );
   }
 
-  if (
-    !Number.isInteger(eventTemplate.kind)
-  ) {
+  if (!eventTemplate.tags) {
+    eventTemplate.tags = [];
+  }
+
+  if (eventTemplate.content === undefined) {
     throw new Error(
-      "Cannot publish Nostr event: invalid kind",
+      "Cannot publish Nostr event without content",
     );
   }
 
-  if (
-    !Array.isArray(eventTemplate.tags)
-  ) {
-    throw new Error(
-      "Cannot publish Nostr event: invalid tags",
-    );
-  }
-
-  if (
-    typeof eventTemplate.content !== "string"
-  ) {
-    throw new Error(
-      "Cannot publish Nostr event: content must be a string",
-    );
-  }
-
-  /**
-   * Check for undefined/null tag values before handing the event to NDK.
-   *
-   * This catches things like:
-   *
-   * ["e", undefined]
+  /*
+   * Manual signing.
    */
-  for (const tag of eventTemplate.tags) {
-    if (!Array.isArray(tag)) {
-      throw new Error(
-        "Cannot publish Nostr event: malformed tag",
-      );
-    }
-
-    for (const value of tag) {
-      if (
-        value === undefined ||
-        value === null
-      ) {
-        throw new Error(
-          `Cannot publish Nostr event: tag contains ${String(value)}: ${JSON.stringify(tag)}`,
-        );
-      }
-    }
-  }
-
-  if (secretNostrKey === undefined) {
-    if (!ndk) {
-      throw new Error(
-        "Cannot publish Nostr event: missing NDK",
-      );
-    }
-
-    const event = new NDKEvent(
-      ndk,
+  if (secretNostrKey !== undefined) {
+    const signedEvent = finalizeEvent(
       eventTemplate,
+      secretNostrKey,
     );
 
-    await event.publish();
-
-    if (!event.id) {
+    if (!verifyEvent(signedEvent)) {
       throw new Error(
-        "Nostr event was published without an ID",
+        "Failed to verify signed Nostr event",
       );
     }
 
-    return event;
+    await pool.publish(
+      explicitRelayUrls || [],
+      signedEvent,
+    );
+
+    return signedEvent;
   }
 
-  const signedEvent = finalizeEvent(
+  /*
+   * NDK signing.
+   */
+  const event = new NDKEvent(
+    ndk,
     eventTemplate,
-    secretNostrKey,
   );
 
-  if (!verifyEvent(signedEvent)) {
-    throw new Error(
-      "Failed to verify signed Nostr event",
-    );
-  }
+  await event.publish();
 
-  if (
-    !explicitRelayUrls ||
-    explicitRelayUrls.length === 0
-  ) {
-    throw new Error(
-      "Cannot publish signed Nostr event: no relay URLs",
-    );
-  }
-
-  await pool.publish(
-    explicitRelayUrls,
-    signedEvent,
-  );
-
-  return signedEvent;
+  return event;
 }
 
-/**
- * Safely run a possibly synchronous or asynchronous function.
- */
-async function resolveValue(value) {
-  return await value;
-}
+/* -------------------------------------------------------------------------- */
+/* Create room                                                                */
+/* -------------------------------------------------------------------------- */
 
-/**
- * Create a Nostr CRDT room.
- *
- * The first initial-state chunk becomes the room creation event.
- *
- * Its event ID is the room ID.
- */
-export async function createNostrCRDTRoom(
-  params,
-) {
+export async function createNostrCRDTRoom(params) {
   const {
     ndk,
     label,
@@ -310,55 +230,34 @@ export async function createNostrCRDTRoom(
     YJS_UPDATE_EVENT_KIND,
     secretNostrKey,
     explicitRelayUrls,
-    encrypt = async (input) => input,
+    encrypt = async (value) => value,
     yjs,
   } = params;
 
-  if (!ndk) {
-    throw new Error(
-      "createNostrCRDTRoom: missing ndk",
-    );
-  }
-
-  if (!label) {
-    throw new Error(
-      "createNostrCRDTRoom: missing label",
-    );
-  }
-
-  if (!Number.isInteger(YJS_UPDATE_EVENT_KIND)) {
-    throw new Error(
-      "createNostrCRDTRoom: invalid YJS_UPDATE_EVENT_KIND",
-    );
-  }
-
+  /*
+   * Legacy mode.
+   */
   if (!yjs) {
-    /**
-     * Compatibility path for callers that don't supply Yjs.
-     */
-    const encrypted =
-      await resolveValue(
-        encrypt(initialLocalState),
-      );
+    const encrypted = await encrypt(
+      toUint8Array(initialLocalState),
+    );
 
-    const event =
-      await publishEvent({
-        ndk,
-        explicitRelayUrls,
-        secretNostrKey,
-        eventTemplate: {
-          kind: YJS_UPDATE_EVENT_KIND,
-          created_at: Math.floor(
-            Date.now() / 1000,
-          ),
-          tags: [
-            ["crdt", label],
-          ],
-          content: toBase64(
-            toUint8Array(encrypted),
-          ),
-        },
-      });
+    const event = await publishEvent({
+      ndk,
+      explicitRelayUrls,
+      secretNostrKey,
+      eventTemplate: {
+        kind: YJS_UPDATE_EVENT_KIND,
+        created_at:
+          Math.floor(Date.now() / 1000),
+        tags: [
+          ["crdt", label],
+        ],
+        content: toBase64(
+          toUint8Array(encrypted),
+        ),
+      },
+    });
 
     return event.id;
   }
@@ -372,7 +271,7 @@ export async function createNostrCRDTRoom(
 
   if (initialChunks.length === 0) {
     throw new Error(
-      "Cannot create Nostr CRDT room from empty Yjs state",
+      "Cannot create Yjs room from an empty update",
     );
   }
 
@@ -382,15 +281,12 @@ export async function createNostrCRDTRoom(
   const total =
     initialChunks.length;
 
-  /**
-   * First chunk becomes room creation event.
+  /*
+   * First chunk creates the room.
    */
-  const firstChunk =
-    initialChunks[0];
-
-  const encryptedFirstChunk =
-    await resolveValue(
-      encrypt(firstChunk),
+  const encryptedFirst =
+    await encrypt(
+      initialChunks[0],
     );
 
   const firstEvent =
@@ -401,50 +297,44 @@ export async function createNostrCRDTRoom(
       eventTemplate: {
         kind:
           YJS_UPDATE_EVENT_KIND,
-
         created_at:
-          Math.floor(
-            Date.now() / 1000,
-          ),
-
+          Math.floor(Date.now() / 1000),
         tags: [
           ["crdt", label],
-
           createChunkTag(
             batchId,
             0,
             total,
           ),
         ],
-
         content: toBase64(
           toUint8Array(
-            encryptedFirstChunk,
+            encryptedFirst,
           ),
         ),
       },
     });
 
   const roomId =
-    validateEventId(
-      firstEvent.id,
-      "room event ID",
-    );
+    firstEvent.id;
 
-  /**
-   * Publish remaining initial-state chunks.
+  if (!roomId) {
+    throw new Error(
+      "Nostr room creation event did not have an event ID",
+    );
+  }
+
+  /*
+   * Remaining initial chunks reference roomId.
    */
   for (
     let i = 1;
     i < initialChunks.length;
     i++
   ) {
-    const chunk =
-      initialChunks[i];
-
     const encrypted =
-      await resolveValue(
-        encrypt(chunk),
+      await encrypt(
+        initialChunks[i],
       );
 
     await publishEvent({
@@ -454,22 +344,16 @@ export async function createNostrCRDTRoom(
       eventTemplate: {
         kind:
           YJS_UPDATE_EVENT_KIND,
-
         created_at:
-          Math.floor(
-            Date.now() / 1000,
-          ),
-
+          Math.floor(Date.now() / 1000),
         tags: [
           ["e", roomId],
-
           createChunkTag(
             batchId,
             i,
             total,
           ),
         ],
-
         content: toBase64(
           toUint8Array(encrypted),
         ),
@@ -480,7 +364,12 @@ export async function createNostrCRDTRoom(
   return roomId;
 }
 
-export class NostrProvider extends ObservableV2 {
+/* -------------------------------------------------------------------------- */
+/* NostrProvider                                                              */
+/* -------------------------------------------------------------------------- */
+
+export class NostrProvider
+  extends ObservableV2 {
   constructor(params) {
     const {
       yjs,
@@ -490,52 +379,18 @@ export class NostrProvider extends ObservableV2 {
       YJS_UPDATE_EVENT_KIND,
       secretNostrKey,
       explicitRelayUrls,
-      encrypt = async (input) => input,
-      decrypt = async (input) => input,
+      encrypt = async (value) => value,
+      decrypt = async (value) => value,
     } = params;
 
     super();
 
-    if (!yjs) {
-      throw new Error(
-        "NostrProvider: missing yjs",
-      );
-    }
-
-    if (!ydoc) {
-      throw new Error(
-        "NostrProvider: missing ydoc",
-      );
-    }
-
-    if (!ndk) {
-      throw new Error(
-        "NostrProvider: missing ndk",
-      );
-    }
-
-    if (!Number.isInteger(YJS_UPDATE_EVENT_KIND)) {
-      throw new Error(
-        "NostrProvider: invalid YJS_UPDATE_EVENT_KIND",
-      );
-    }
-
-    /**
-     * This is deliberately strict.
-     *
-     * The bug you encountered was:
-     *
-     * ["e", undefined]
-     */
-    this.nostrRoomCreateEventId =
-      validateEventId(
-        nostrRoomCreateEventId,
-        "nostrRoomCreateEventId",
-      );
-
     this.yjs = yjs;
     this.ydoc = ydoc;
     this.ndk = ndk;
+
+    this.nostrRoomCreateEventId =
+      nostrRoomCreateEventId;
 
     this.YJS_UPDATE_EVENT_KIND =
       YJS_UPDATE_EVENT_KIND;
@@ -549,105 +404,71 @@ export class NostrProvider extends ObservableV2 {
     this.encrypt = encrypt;
     this.decrypt = decrypt;
 
-    /**
-     * batchId -> {
-     *
-     *   total,
-     *   chunks,
-     *   received,
-     *   createdAt
-     *
-     * }
-     */
-    this.chunkBuffer =
-      new Map();
+    this.chunkBuffer = new Map();
 
     this.chunkBufferMaxAge =
-      CHUNK_BUFFER_MAX_AGE;
+      10 * 60 * 1000;
 
     this.pendingUpdates = [];
-
     this.sendPendingTimeout =
       undefined;
 
-    this.destroyed = false;
-
-    /**
-     * Keep a reference so we can remove it during destroy().
-     */
-    this.documentUpdateHandler =
-      (update, origin) => {
-        this.documentUpdateListener(
-          update,
-          origin,
-        );
-      };
+    if (
+      !this.nostrRoomCreateEventId
+    ) {
+      console.warn(
+        "[YJS] NostrProvider created without nostrRoomCreateEventId",
+      );
+    }
 
     this.ydoc.on(
       "update",
-      this.documentUpdateHandler,
+      (update, origin) => {
+        void this.documentUpdateListener(
+          update,
+          origin,
+        );
+      },
     );
   }
 
-  /**
-   * Encrypt one Yjs update.
-   *
-   * Supports synchronous and asynchronous crypto implementations.
-   */
-  async encryptUpdate(update) {
-    const encrypted =
-      await resolveValue(
-        this.encrypt(
-          toUint8Array(update),
-        ),
-      );
+  /* ------------------------------------------------------------------------ */
+  /* Decode events                                                            */
+  /* ------------------------------------------------------------------------ */
 
-    return toUint8Array(
-      encrypted,
-    );
-  }
-
-  /**
-   * Decrypt one Nostr event payload.
-   */
-  async decryptUpdate(content) {
-    const encoded =
-      fromBase64(content);
-
-    const decrypted =
-      await resolveValue(
-        this.decrypt(encoded),
-      );
-
-    return toUint8Array(
-      decrypted,
-    );
-  }
-
-  /**
-   * Convert Nostr events into one merged Yjs update.
-   *
-   * This method is asynchronous because encryption/decryption may be async.
-   */
   async updateFromEvents(events) {
     const updates = [];
 
     for (const event of events) {
       try {
-        const update =
-          await this.decryptUpdate(
+        const encoded =
+          fromBase64(
             event.content,
           );
 
+        const decrypted =
+          await this.decrypt(
+            encoded,
+          );
+
+        const update =
+          normalizeDecryptedValue(
+            decrypted,
+          );
+
         if (
-          update &&
-          update.length > 0
+          update.byteLength === 0
         ) {
-          updates.push(update);
+          console.warn(
+            "[YJS] Ignoring empty decrypted update",
+          );
+          continue;
         }
+
+        updates.push(update);
       } catch (error) {
         console.error(
-          "Failed to decode/decrypt Nostr Yjs event:",
+          "[YJS] Failed to decode/decrypt event:",
           error,
         );
       }
@@ -657,41 +478,39 @@ export class NostrProvider extends ObservableV2 {
       return undefined;
     }
 
-    return this.yjs.mergeUpdates(
-      updates,
+    return toUint8Array(
+      this.yjs.mergeUpdates(
+        updates,
+      ),
     );
   }
 
-  /**
-   * Publish a single Yjs update.
-   */
+  /* ------------------------------------------------------------------------ */
+  /* Publish                                                                  */
+  /* ------------------------------------------------------------------------ */
+
   async publishUpdate(update) {
     return this.publishUpdates([
       update,
     ]);
   }
 
-  /**
-   * Publish multiple Yjs updates.
-   *
-   * Complete Yjs updates are merged into conservative chunks.
-   */
   async publishUpdates(updates) {
     if (
-      this.destroyed ||
       !updates ||
       updates.length === 0
     ) {
       return;
     }
 
-    /**
-     * Never allow undefined room IDs into Nostr tags.
-     */
-    validateEventId(
-      this.nostrRoomCreateEventId,
-      "nostrRoomCreateEventId",
-    );
+    if (
+      !this.nostrRoomCreateEventId
+    ) {
+      throw new Error(
+        "[YJS] Cannot publish update: " +
+          "nostrRoomCreateEventId is undefined",
+      );
+    }
 
     const chunks =
       splitUpdatesIntoChunks(
@@ -699,10 +518,6 @@ export class NostrProvider extends ObservableV2 {
         updates,
         NOSTR_UPDATE_CHUNK_BYTES,
       );
-
-    if (chunks.length === 0) {
-      return;
-    }
 
     const batchId =
       crypto.randomUUID();
@@ -718,22 +533,69 @@ export class NostrProvider extends ObservableV2 {
       const chunk =
         chunks[i];
 
+      if (
+        !(chunk instanceof Uint8Array)
+      ) {
+        throw new Error(
+          "[YJS] Chunk is not Uint8Array",
+        );
+      }
+
+      if (
+        chunk.byteLength === 0
+      ) {
+        console.warn(
+          "[YJS] Refusing to publish empty Yjs chunk",
+        );
+        continue;
+      }
+
+      /*
+       * Encryption is asynchronous.
+       */
       const encrypted =
-        await this.encryptUpdate(
+        await this.encrypt(
           chunk,
         );
 
-      const content =
-        toBase64(
+      if (
+        encrypted == null
+      ) {
+        throw new Error(
+          "[YJS] encrypt() returned null/undefined",
+        );
+      }
+
+      const encryptedBytes =
+        toUint8Array(
           encrypted,
         );
+
+      if (
+        encryptedBytes.byteLength ===
+        0
+      ) {
+        throw new Error(
+          "[YJS] Encryption produced empty data",
+        );
+      }
+
+      const content =
+        toBase64(
+          encryptedBytes,
+        );
+
+      if (!content) {
+        throw new Error(
+          "[YJS] Base64 encoded content is empty",
+        );
+      }
 
       const tags = [
         [
           "e",
           this.nostrRoomCreateEventId,
         ],
-
         createChunkTag(
           batchId,
           i,
@@ -741,62 +603,67 @@ export class NostrProvider extends ObservableV2 {
         ),
       ];
 
+      console.log(
+        "[YJS] Publishing chunk",
+        {
+          batchId,
+          index: i,
+          total,
+          rawBytes:
+            chunk.byteLength,
+          encryptedBytes:
+            encryptedBytes.byteLength,
+          base64Bytes:
+            content.length,
+        },
+      );
+
       await publishEvent({
         ndk: this.ndk,
         explicitRelayUrls:
           this.explicitRelayUrls,
         secretNostrKey:
           this.secretNostrKey,
-
         eventTemplate: {
           kind:
             this.YJS_UPDATE_EVENT_KIND,
-
           created_at:
             Math.floor(
               Date.now() / 1000,
             ),
-
           tags,
-
           content,
         },
       });
     }
   }
 
-  /**
-   * Queue a Yjs update for publication.
-   */
+  /* ------------------------------------------------------------------------ */
+  /* Local updates                                                            */
+  /* ------------------------------------------------------------------------ */
+
   async documentUpdateListener(
     update,
     origin,
   ) {
-    if (this.destroyed) {
-      return;
-    }
-
-    /**
-     * Do not rebroadcast updates that originated from this provider.
+    /*
+     * Remote Yjs changes must not be
+     * rebroadcast.
      */
     if (origin === this) {
       return;
     }
 
-    /**
-     * Do not rebroadcast updates originating from another provider.
-     */
     if (origin?.provider) {
       return;
     }
 
     this.pendingUpdates.push(
-      update,
+      toUint8Array(update),
     );
 
     if (
-      this.sendPendingTimeout !==
-      undefined
+      this.sendPendingTimeout
     ) {
       clearTimeout(
         this.sendPendingTimeout,
@@ -806,17 +673,14 @@ export class NostrProvider extends ObservableV2 {
     this.sendPendingTimeout =
       setTimeout(
         async () => {
-          this.sendPendingTimeout =
-            undefined;
-
-          if (this.destroyed) {
-            return;
-          }
-
           const updates =
             this.pendingUpdates;
 
-          this.pendingUpdates = [];
+          this.pendingUpdates =
+            [];
+
+          this.sendPendingTimeout =
+            undefined;
 
           try {
             await this.publishUpdates(
@@ -828,8 +692,8 @@ export class NostrProvider extends ObservableV2 {
               error,
             );
 
-            /**
-             * Put failed updates back at the front.
+            /*
+             * Don't lose updates.
              */
             this.pendingUpdates.unshift(
               ...updates,
@@ -840,18 +704,17 @@ export class NostrProvider extends ObservableV2 {
       );
   }
 
-  /**
-   * Remove stale incomplete batches.
-   */
+  /* ------------------------------------------------------------------------ */
+  /* Chunk cleanup                                                            */
+  /* ------------------------------------------------------------------------ */
+
   cleanupChunkBuffer() {
     const now =
       Date.now();
 
     for (
-      const [
-        batchId,
-        batch,
-      ] of this.chunkBuffer
+      const [batchId, batch] of
+        this.chunkBuffer
     ) {
       if (
         now - batch.createdAt >
@@ -864,39 +727,45 @@ export class NostrProvider extends ObservableV2 {
     }
   }
 
-  /**
-   * Process one incoming Nostr event.
-   */
+  /* ------------------------------------------------------------------------ */
+  /* Incoming event                                                           */
+  /* ------------------------------------------------------------------------ */
+
   async processIncomingEvent(
     event,
   ) {
-    if (
-      this.destroyed ||
-      !event
-    ) {
-      return;
-    }
-
     const chunkTag =
       event.tags?.find(
         (tag) =>
-          tag?.[0] === "chunk",
+          tag[0] === "chunk",
       );
 
-    /**
+    /*
      * Legacy event.
      */
     if (!chunkTag) {
       try {
-        const update =
-          await this.decryptUpdate(
+        const encoded =
+          fromBase64(
             event.content,
           );
 
+        const decrypted =
+          await this.decrypt(
+            encoded,
+          );
+
+        const update =
+          normalizeDecryptedValue(
+            decrypted,
+          );
+
         if (
-          !update ||
-          update.length === 0
+          update.byteLength === 0
         ) {
+          console.warn(
+            "[YJS] Ignoring empty legacy update",
+          );
           return;
         }
 
@@ -907,7 +776,7 @@ export class NostrProvider extends ObservableV2 {
         );
       } catch (error) {
         console.error(
-          "Failed to process incoming Yjs event:",
+          "[YJS] Failed to process incoming Yjs event:",
           error,
         );
       }
@@ -937,7 +806,7 @@ export class NostrProvider extends ObservableV2 {
       index >= total
     ) {
       console.warn(
-        "Ignoring invalid Nostr Yjs chunk:",
+        "[YJS] Ignoring invalid chunk:",
         chunkTag,
       );
 
@@ -954,12 +823,9 @@ export class NostrProvider extends ObservableV2 {
     if (!batch) {
       batch = {
         total,
-
         chunks:
           new Array(total),
-
         received: 0,
-
         createdAt:
           Date.now(),
       };
@@ -970,23 +836,23 @@ export class NostrProvider extends ObservableV2 {
       );
     }
 
-    /**
-     * Don't accept chunks claiming a different total.
-     */
     if (
       batch.total !== total
     ) {
       console.warn(
-        "Ignoring chunk with mismatched total:",
-        chunkTag,
+        "[YJS] Chunk total mismatch:",
+        {
+          batchId,
+          expected:
+            batch.total,
+          received:
+            total,
+        },
       );
 
       return;
     }
 
-    /**
-     * Duplicate chunk.
-     */
     if (
       batch.chunks[index] !==
       undefined
@@ -994,16 +860,39 @@ export class NostrProvider extends ObservableV2 {
       return;
     }
 
-    let update;
-
     try {
-      update =
-        await this.decryptUpdate(
+      const encoded =
+        fromBase64(
           event.content,
         );
+
+      const decrypted =
+        await this.decrypt(
+          encoded,
+        );
+
+      const update =
+        normalizeDecryptedValue(
+          decrypted,
+        );
+
+      if (
+        update.byteLength === 0
+      ) {
+        console.warn(
+          "[YJS] Ignoring empty chunk",
+          chunkTag,
+        );
+        return;
+      }
+
+      batch.chunks[index] =
+        update;
+
+      batch.received++;
     } catch (error) {
       console.error(
-        "Failed to decode/decrypt incoming Yjs chunk:",
+        "[YJS] Failed to decode/decrypt incoming chunk:",
         error,
       );
 
@@ -1011,55 +900,30 @@ export class NostrProvider extends ObservableV2 {
     }
 
     if (
-      !update ||
-      update.length === 0
-    ) {
-      console.warn(
-        "Ignoring empty Yjs chunk:",
-        chunkTag,
-      );
-
-      return;
-    }
-
-    batch.chunks[index] =
-      update;
-
-    batch.received++;
-
-    /**
-     * Wait until every chunk arrives.
-     */
-    if (
       batch.received !==
       batch.total
     ) {
       return;
     }
 
-    /**
-     * Verify every position exists.
-     */
-    for (
-      let i = 0;
-      i < batch.total;
-      i++
+    if (
+      batch.chunks.some(
+        (chunk) =>
+          chunk === undefined,
+      )
     ) {
-      if (
-        batch.chunks[i] ===
-        undefined
-      ) {
-        console.warn(
-          "Chunk batch reported complete but has missing chunk:",
-          {
-            batchId,
-            index: i,
-            total: batch.total,
-          },
-        );
+      console.error(
+        "[YJS] Batch is complete but contains missing chunks",
+        {
+          batchId,
+          total:
+            batch.total,
+          received:
+            batch.received,
+        },
+      );
 
-        return;
-      }
+      return;
     }
 
     try {
@@ -1071,18 +935,28 @@ export class NostrProvider extends ObservableV2 {
             batch.total,
           received:
             batch.received,
+          sizes:
+            batch.chunks.map(
+              (chunk) =>
+                chunk?.byteLength,
+            ),
         },
       );
 
-      /**
-       * The chunks themselves are complete Yjs updates.
-       *
-       * mergeUpdates() reconstructs one valid update.
-       */
       const mergedUpdate =
         this.yjs.mergeUpdates(
           batch.chunks,
         );
+
+      if (
+        !mergedUpdate ||
+        mergedUpdate.byteLength ===
+          0
+      ) {
+        throw new Error(
+          "Yjs mergeUpdates() returned an empty update",
+        );
+      }
 
       this.chunkBuffer.delete(
         batchId,
@@ -1095,7 +969,7 @@ export class NostrProvider extends ObservableV2 {
       );
     } catch (error) {
       console.error(
-        "Failed to reassemble Yjs chunk batch:",
+        "[YJS] Failed to reassemble Yjs chunk batch:",
         error,
       );
 
@@ -1105,55 +979,40 @@ export class NostrProvider extends ObservableV2 {
     }
   }
 
-  /**
-   * Process multiple events.
-   */
-  async processIncomingEvents(
+  processIncomingEvents(
     events,
   ) {
-    if (
-      !events ||
-      events.length === 0
-    ) {
-      return;
-    }
-
     for (const event of events) {
-      await this.processIncomingEvent(
+      void this.processIncomingEvent(
         event,
       );
     }
   }
 
-  /**
-   * Reassemble complete historical chunk batches.
-   *
-   * Incomplete batches are omitted.
-   */
+  /* ------------------------------------------------------------------------ */
+  /* Initial history                                                          */
+  /* ------------------------------------------------------------------------ */
+
   updateFromInitialEvents(
     events,
   ) {
-    const completeEvents =
-      [];
-
-    const batches =
-      new Map();
+    const completeEvents = [];
+    const batches = new Map();
 
     for (const event of events) {
       const chunkTag =
         event.tags?.find(
           (tag) =>
-            tag?.[0] === "chunk",
+            tag[0] === "chunk",
         );
 
-      /**
-       * Legacy unchunked event.
+      /*
+       * Legacy event.
        */
       if (!chunkTag) {
         completeEvents.push(
           event,
         );
-
         continue;
       }
 
@@ -1189,10 +1048,8 @@ export class NostrProvider extends ObservableV2 {
       if (!batch) {
         batch = {
           total,
-
           events:
             new Array(total),
-
           received: 0,
         };
 
@@ -1221,9 +1078,6 @@ export class NostrProvider extends ObservableV2 {
       batch.received++;
     }
 
-    /**
-     * Only return complete batches.
-     */
     for (
       const batch of
         batches.values()
@@ -1235,30 +1089,15 @@ export class NostrProvider extends ObservableV2 {
         continue;
       }
 
-      let complete =
-        true;
-
-      for (
-        let i = 0;
-        i < batch.total;
-        i++
+      if (
+        batch.events.some(
+          (event) =>
+            event === undefined,
+        )
       ) {
-        if (
-          batch.events[i] ===
-          undefined
-        ) {
-          complete = false;
-          break;
-        }
-      }
-
-      if (!complete) {
         continue;
       }
 
-      /**
-       * Sort by chunk index.
-       */
       completeEvents.push(
         ...batch.events,
       );
@@ -1267,17 +1106,24 @@ export class NostrProvider extends ObservableV2 {
     return completeEvents;
   }
 
-  /**
-   * Initialize the provider.
-   */
+  /* ------------------------------------------------------------------------ */
+  /* Initialize                                                               */
+  /* ------------------------------------------------------------------------ */
+
   async initialize() {
-    if (this.destroyed) {
+    if (
+      !this.nostrRoomCreateEventId
+    ) {
+      console.error(
+        "[YJS] Cannot initialize provider: " +
+          "nostrRoomCreateEventId is undefined",
+      );
+
       return;
     }
 
     try {
-      let eoseSeen =
-        false;
+      let eoseSeen = false;
 
       const initialEvents =
         [];
@@ -1288,7 +1134,6 @@ export class NostrProvider extends ObservableV2 {
             kinds: [
               this.YJS_UPDATE_EVENT_KIND,
             ],
-
             "#e": [
               this.nostrRoomCreateEventId,
             ],
@@ -1298,32 +1143,16 @@ export class NostrProvider extends ObservableV2 {
           },
         );
 
-      this.subscription =
-        sub;
-
       sub.on(
         "event",
         (event) => {
-          if (
-            this.destroyed
-          ) {
-            return;
-          }
-
           if (!eoseSeen) {
             initialEvents.push(
               event,
             );
           } else {
-            this.processIncomingEvent(
+            void this.processIncomingEvent(
               event,
-            ).catch(
-              (error) => {
-                console.error(
-                  "Failed to process incoming Nostr event:",
-                  error,
-                );
-              },
             );
           }
         },
@@ -1332,22 +1161,9 @@ export class NostrProvider extends ObservableV2 {
       sub.on(
         "events",
         (events) => {
-          if (
-            this.destroyed
-          ) {
-            return;
-          }
-
           if (eoseSeen) {
             this.processIncomingEvents(
               events,
-            ).catch(
-              (error) => {
-                console.error(
-                  "Failed to process incoming Nostr events:",
-                  error,
-                );
-              },
             );
           }
         },
@@ -1355,256 +1171,172 @@ export class NostrProvider extends ObservableV2 {
 
       sub.on(
         "eose",
-        () => {
+        async () => {
+          eoseSeen = true;
+
+          const usableInitialEvents =
+            this.updateFromInitialEvents(
+              initialEvents,
+            );
+
+          console.log(
+            "[YJS] Initial events",
+            {
+              received:
+                initialEvents.length,
+              usable:
+                usableInitialEvents.length,
+            },
+          );
+
+          const initialLocalState =
+            this.yjs.encodeStateAsUpdate(
+              this.ydoc,
+            );
+
+          const initialLocalStateVector =
+            this.yjs.encodeStateVectorFromUpdate(
+              initialLocalState,
+            );
+
+          const deleteSetOnlyUpdate =
+            this.yjs.diffUpdate(
+              initialLocalState,
+              initialLocalStateVector,
+            );
+
+          const oldSnapshot =
+            this.yjs.snapshot(
+              this.ydoc,
+            );
+
+          let update;
+
+          /*
+           * Apply remote history.
+           */
           if (
-            this.destroyed ||
-            eoseSeen
+            usableInitialEvents.length >
+            0
           ) {
+            update =
+              await this.updateFromEvents(
+                usableInitialEvents,
+              );
+
+            if (
+              update !==
+              undefined
+            ) {
+              this.yjs.applyUpdate(
+                this.ydoc,
+                update,
+                this,
+              );
+            }
+          }
+
+          /*
+           * No remote state.
+           */
+          if (
+            usableInitialEvents.length ===
+              0 ||
+            update === undefined
+          ) {
+            const localUpdate =
+              this.yjs.encodeStateAsUpdate(
+                this.ydoc,
+              );
+
+            if (
+              localUpdate.length >
+              2
+            ) {
+              try {
+                await this.publishUpdates(
+                  [localUpdate],
+                );
+              } catch (error) {
+                console.error(
+                  "[YJS] Failed to publish initial Yjs update:",
+                  error,
+                );
+              }
+            }
+
             return;
           }
 
-          eoseSeen = true;
+          /*
+           * Find local state missing
+           * from remote state.
+           */
+          const remoteStateVector =
+            this.yjs.encodeStateVectorFromUpdate(
+              update,
+            );
 
-          this.handleInitialEvents(
-            initialEvents,
-          ).catch(
-            (error) => {
+          const missingOnWire =
+            this.yjs.diffUpdate(
+              initialLocalState,
+              remoteStateVector,
+            );
+
+          /*
+           * Preserve delete-set check.
+           */
+          if (
+            arrayBuffersAreEqual(
+              deleteSetOnlyUpdate.buffer,
+              missingOnWire.buffer,
+            )
+          ) {
+            const serverDoc =
+              new this.yjs.Doc();
+
+            this.yjs.applyUpdate(
+              serverDoc,
+              update,
+            );
+
+            const serverSnapshot =
+              this.yjs.snapshot(
+                serverDoc,
+              );
+
+            snapshotContainsAllDeletes(
+              serverSnapshot,
+              oldSnapshot,
+            );
+          }
+
+          /*
+           * Publish local changes
+           * not present remotely.
+           */
+          if (
+            missingOnWire.length >
+            2
+          ) {
+            try {
+              await this.publishUpdates(
+                [missingOnWire],
+              );
+            } catch (error) {
               console.error(
-                "Failed to initialize Yjs from Nostr:",
+                "[YJS] Failed to publish missing Yjs update:",
                 error,
               );
-            },
-          );
+            }
+          }
         },
       );
     } catch (error) {
       console.error(
-        "NostrProvider initialization failed:",
-        error,
-      );
-
-      throw error;
-    }
-  }
-
-  /**
-   * Handle initial remote history after EOSE.
-   */
-  async handleInitialEvents(
-    initialEvents,
-  ) {
-    if (this.destroyed) {
-      return;
-    }
-
-    /**
-     * Reassemble complete historical batches.
-     */
-    const usableInitialEvents =
-      this.updateFromInitialEvents(
-        initialEvents,
-      );
-
-    /**
-     * Capture local state BEFORE applying remote state.
-     */
-    const initialLocalState =
-      this.yjs.encodeStateAsUpdate(
-        this.ydoc,
-      );
-
-    const initialLocalStateVector =
-      this.yjs.encodeStateVectorFromUpdate(
-        initialLocalState,
-      );
-
-    const deleteSetOnlyUpdate =
-      this.yjs.diffUpdate(
-        initialLocalState,
-        initialLocalStateVector,
-      );
-
-    const oldSnapshot =
-      this.yjs.snapshot(
-        this.ydoc,
-      );
-
-    let remoteUpdate;
-
-    /**
-     * Apply remote history.
-     */
-    if (
-      usableInitialEvents.length >
-      0
-    ) {
-      remoteUpdate =
-        await this.updateFromEvents(
-          usableInitialEvents,
-        );
-
-      if (
-        remoteUpdate !==
-        undefined
-      ) {
-        this.yjs.applyUpdate(
-          this.ydoc,
-          remoteUpdate,
-          this,
-        );
-      }
-    }
-
-    /**
-     * No remote state exists.
-     *
-     * Publish local state.
-     */
-    if (
-      usableInitialEvents.length ===
-        0 ||
-      remoteUpdate === undefined
-    ) {
-      const localUpdate =
-        this.yjs.encodeStateAsUpdate(
-          this.ydoc,
-        );
-
-      if (
-        localUpdate.length > 2
-      ) {
-        await this.publishUpdates([
-          localUpdate,
-        ]);
-      }
-
-      return;
-    }
-
-    /**
-     * Determine which local changes aren't on the server.
-     */
-    const remoteStateVector =
-      this.yjs.encodeStateVectorFromUpdate(
-        remoteUpdate,
-      );
-
-    const missingOnWire =
-      this.yjs.diffUpdate(
-        initialLocalState,
-        remoteStateVector,
-      );
-
-    /**
-     * Preserve the existing delete-set safety check.
-     */
-    if (
-      arrayBuffersAreEqual(
-        deleteSetOnlyUpdate.buffer,
-        missingOnWire.buffer,
-      )
-    ) {
-      const serverDoc =
-        new this.yjs.Doc();
-
-      this.yjs.applyUpdate(
-        serverDoc,
-        remoteUpdate,
-      );
-
-      const serverSnapshot =
-        this.yjs.snapshot(
-          serverDoc,
-        );
-
-      if (
-        snapshotContainsAllDeletes(
-          serverSnapshot,
-          oldSnapshot,
-        )
-      ) {
-        /**
-         * missingOnWire only represents deletes already represented
-         * by the server.
-         */
-      }
-    }
-
-    /**
-     * Publish local changes that weren't present remotely.
-     */
-    if (
-      missingOnWire.length > 2
-    ) {
-      await this.publishUpdates([
-        missingOnWire,
-      ]);
-    }
-  }
-
-  /**
-   * Stop synchronization and remove listeners.
-   */
-  destroy() {
-    if (this.destroyed) {
-      return;
-    }
-
-    this.destroyed = true;
-
-    if (
-      this.sendPendingTimeout !==
-      undefined
-    ) {
-      clearTimeout(
-        this.sendPendingTimeout,
-      );
-
-      this.sendPendingTimeout =
-        undefined;
-    }
-
-    /**
-     * Remove Yjs listener.
-     */
-    if (
-      this.ydoc &&
-      this.documentUpdateHandler
-    ) {
-      this.ydoc.off(
-        "update",
-        this.documentUpdateHandler,
-      );
-    }
-
-    /**
-     * Close NDK subscription.
-     */
-    try {
-      this.subscription?.stop?.();
-    } catch (error) {
-      console.warn(
-        "Failed to stop Nostr subscription:",
+        "[YJS] initialize() failed:",
         error,
       );
     }
-
-    try {
-      this.subscription?.close?.();
-    } catch (error) {
-      console.warn(
-        "Failed to close Nostr subscription:",
-        error,
-      );
-    }
-
-    this.subscription =
-      undefined;
-
-    this.pendingUpdates = [];
-
-    this.chunkBuffer.clear();
-
-    this.destroy?.();
   }
 }
