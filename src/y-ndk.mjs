@@ -198,37 +198,58 @@ async function runEncrypt(encrypt, input) {
     encrypted: result.encrypted === true,
   };
 }
-
 async function runDecrypt(
   decrypt,
   input,
   encrypted,
 ) {
   /*
-   * Encryption/decryption is owned entirely by the callback supplied
-   * by the caller.
+   * The event itself determines whether decryption is required.
    *
-   * For plaintext events, there is nothing to decrypt.
+   * Plaintext event:
+   *   return the original bytes untouched.
+   *
+   * Encrypted event:
+   *   call the decrypt callback supplied by the application.
+   *
+   * y-ndk deliberately knows nothing about age identities,
+   * recipients, keys, or encryption configuration.
    */
+
   if (!encrypted) {
     return toUint8Array(input);
   }
 
+  /*
+   * An encrypted event is valid Nostr/Yjs data, but this particular
+   * client may intentionally be operating in plaintext mode.
+   *
+   * Do NOT pass ciphertext through as plaintext.
+   *
+   * Returning undefined from runDecrypt() lets callers distinguish
+   * "not decryptable by this client" from a successful plaintext
+   * decode.
+   */
   if (typeof decrypt !== "function") {
-    throw new Error(
-      "[YJS] Received encrypted event but no decrypt() function is configured",
+    console.warn(
+      "[YJS] Skipping encrypted event: no decrypt() function is configured",
     );
+
+    return undefined;
   }
 
   /*
-   * IMPORTANT:
+   * The application owns all crypto state through the closure.
    *
-   * Do not pass identities, recipients, keys, configuration, or context.
-   *
-   * The callback is responsible for all of that through its closure.
+   * y-ndk passes ONLY the ciphertext.
    */
   const result = await decrypt(input);
 
+  /*
+   * A configured decrypt function returning undefined/null is different
+   * from having no decrypt function at all. It indicates that the caller's
+   * crypto implementation could not produce plaintext.
+   */
   if (result == null) {
     throw new Error(
       "[YJS] decrypt() returned null/undefined",
@@ -455,8 +476,7 @@ export class NostrProvider extends ObservableV2 {
         data: value,
         encrypted: false,
       }),
-
-      decrypt = async (value) => value,
+      decrypt = undefined,
     } = params;
 
     super();
@@ -559,6 +579,10 @@ export class NostrProvider extends ObservableV2 {
       try {
         const update =
           await this.decodeEvent(event);
+
+        if (update == null) {
+          continue;
+        }
 
         if (update.byteLength === 0) {
           console.warn(
@@ -818,6 +842,10 @@ export class NostrProvider extends ObservableV2 {
         const update =
           await this.decodeEvent(event);
 
+        if (update == null) {
+          return;
+        }
+
         if (update.byteLength === 0) {
           return;
         }
@@ -898,6 +926,10 @@ export class NostrProvider extends ObservableV2 {
     try {
       const update =
         await this.decodeEvent(event);
+
+      if (update == null) {
+        return;
+      }
 
       if (update.byteLength === 0) {
         return;
