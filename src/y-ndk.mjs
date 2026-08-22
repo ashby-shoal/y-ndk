@@ -54,18 +54,27 @@ function normalizeDecryptedValue(value) {
   return toUint8Array(value);
 }
 
-/*
- * Encryption remains completely controlled by the encrypt() callback.
- *
- * The callback returns:
- *
- *   {
- *     data: Uint8Array,
- *     encrypted: boolean
- *   }
- *
- * The provider does not know how encryption works.
- */
+function randomId() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+
+  // UUID v4
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+  const hex = Array.from(bytes, (b) =>
+    b.toString(16).padStart(2, "0")
+  ).join("");
+
+  return (
+    hex.slice(0, 8) + "-" +
+    hex.slice(8, 12) + "-" +
+    hex.slice(12, 16) + "-" +
+    hex.slice(16, 20) + "-" +
+    hex.slice(20)
+  );
+}
+
 function getEncryptionTag(encrypted) {
   return encrypted ? [ENC_TAG_NAME, ENC_AGE] : undefined;
 }
@@ -381,7 +390,7 @@ export async function createNostrCRDTRoom(params) {
     );
   }
 
-  const batchId = crypto.randomUUID();
+  const batchId = randomId();
   const total = initialChunks.length;
 
   const encryptedFirst = await runEncrypt(
@@ -684,7 +693,7 @@ export class NostrProvider extends ObservableV2 {
       NOSTR_UPDATE_CHUNK_BYTES,
     );
 
-    const batchId = crypto.randomUUID();
+    const batchId = randomId();
     const total = chunks.length;
 
     for (
