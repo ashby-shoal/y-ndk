@@ -11,7 +11,7 @@ import {
 
 const pool = new SimplePool();
 
-const NOSTR_UPDATE_CHUNK_BYTES = 32 * 1024;
+const NOSTR_UPDATE_CHUNK_BYTES = 64 * 1024;
 
 const ENC_TAG_NAME = "enc";
 const ENC_AGE = "age";
