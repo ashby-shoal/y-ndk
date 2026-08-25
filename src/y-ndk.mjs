@@ -550,15 +550,15 @@ export class NostrProvider extends ObservableV2 {
     const encrypted =
       hasAgeEncryptionTag(event);
 
-    console.log(
-      "[YJS] Decoding event",
-      {
-        id: event.id,
-        encrypted,
-        contentBytes: encoded.byteLength,
-        tags: event.tags,
-      },
-    );
+    // console.log(
+    //   "[YJS] Decoding event",
+    //   {
+    //     id: event.id,
+    //     encrypted,
+    //     contentBytes: encoded.byteLength,
+    //     tags: event.tags,
+    //   },
+    // );
 
     const update = await runDecrypt(
       this.decrypt,
@@ -585,17 +585,17 @@ export class NostrProvider extends ObservableV2 {
       return undefined;
     }
 
-    console.log(
-      "[YJS] Decoded event",
-      {
-        id: event.id,
-        encrypted,
-        updateBytes: update.byteLength,
-        firstBytes: Array.from(
-          update.slice(0, 16),
-        ),
-      },
-    );
+    // console.log(
+    //   "[YJS] Decoded event",
+    //   {
+    //     id: event.id,
+    //     encrypted,
+    //     updateBytes: update.byteLength,
+    //     firstBytes: Array.from(
+    //       update.slice(0, 16),
+    //     ),
+    //   },
+    // );
 
     return update;
   }
@@ -734,19 +734,19 @@ export class NostrProvider extends ObservableV2 {
         encrypted.encrypted,
       );
 
-      console.log(
-        "[YJS] Publishing chunk",
-        {
-          batchId,
-          index: i,
-          total,
-          encrypted: encrypted.encrypted,
-          rawBytes: chunk.byteLength,
-          encryptedBytes:
-            encrypted.data.byteLength,
-          base64Bytes: content.length,
-        },
-      );
+      // console.log(
+      //   "[YJS] Publishing chunk",
+      //   {
+      //     batchId,
+      //     index: i,
+      //     total,
+      //     encrypted: encrypted.encrypted,
+      //     rawBytes: chunk.byteLength,
+      //     encryptedBytes:
+      //       encrypted.data.byteLength,
+      //     base64Bytes: content.length,
+      //   },
+      // );
 
       await publishEvent({
         ndk: this.ndk,
@@ -1217,15 +1217,15 @@ export class NostrProvider extends ObservableV2 {
               initialEvents,
             );
 
-          console.log(
-            "[YJS] Initial events",
-            {
-              received:
-                initialEvents.length,
-              usable:
-                usableInitialEvents.length,
-            },
-          );
+          // console.log(
+          //   "[YJS] Initial events",
+          //   {
+          //     received:
+          //       initialEvents.length,
+          //     usable:
+          //       usableInitialEvents.length,
+          //   },
+          // );
 
           const initialLocalState =
             this.yjs.encodeStateAsUpdate(
