@@ -11,7 +11,7 @@ import {
 
 const pool = new SimplePool();
 
-const NOSTR_UPDATE_CHUNK_BYTES = 128 * 1024;
+const NOSTR_UPDATE_CHUNK_BYTES = 256 * 1024;
 
 const ENC_TAG_NAME = "enc";
 const ENC_AGE = "age";
@@ -510,8 +510,7 @@ export class NostrProvider extends ObservableV2 {
     this.decrypt = decrypt;
 
     this.chunkBuffer = new Map();
-    this.chunkBufferMaxAge = 10 * 60 * 1000;
-
+    this.chunkBufferMaxAge = 60 * 60 * 1000;
     this.pendingUpdates = [];
     this.sendPendingTimeout = undefined;
 
