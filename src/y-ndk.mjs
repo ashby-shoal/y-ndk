@@ -240,9 +240,7 @@ async function runDecrypt(
    * decode.
    */
   if (typeof decrypt !== "function") {
-    console.warn(
-      "[YJS] Skipping encrypted event: no decrypt() function is configured",
-    );
+
 
     return undefined;
   }
@@ -533,9 +531,7 @@ export class NostrProvider extends ObservableV2 {
     );
 
     if (!this.nostrRoomCreateEventId) {
-      console.warn(
-        "[YJS] NostrProvider created without nostrRoomCreateEventId",
-      );
+
     }
   }
 
@@ -548,16 +544,6 @@ export class NostrProvider extends ObservableV2 {
 
     const encrypted =
       hasAgeEncryptionTag(event);
-
-    // console.log(
-    //   "[YJS] Decoding event",
-    //   {
-    //     id: event.id,
-    //     encrypted,
-    //     contentBytes: encoded.byteLength,
-    //     tags: event.tags,
-    //   },
-    // );
 
     const update = await runDecrypt(
       this.decrypt,
@@ -573,28 +559,11 @@ export class NostrProvider extends ObservableV2 {
      * age keys, or encryption configuration.
      */
     if (update == null) {
-      console.warn(
-        "[YJS] Event could not be decoded by this client",
-        {
-          id: event.id,
-          encrypted,
-        },
-      );
+
 
       return undefined;
     }
 
-    // console.log(
-    //   "[YJS] Decoded event",
-    //   {
-    //     id: event.id,
-    //     encrypted,
-    //     updateBytes: update.byteLength,
-    //     firstBytes: Array.from(
-    //       update.slice(0, 16),
-    //     ),
-    //   },
-    // );
 
     return update;
   }
@@ -618,9 +587,7 @@ export class NostrProvider extends ObservableV2 {
         }
 
         if (update.byteLength === 0) {
-          console.warn(
-            "[YJS] Ignoring empty decrypted update",
-          );
+
           continue;
         }
 
@@ -732,20 +699,6 @@ export class NostrProvider extends ObservableV2 {
         ],
         encrypted.encrypted,
       );
-
-      // console.log(
-      //   "[YJS] Publishing chunk",
-      //   {
-      //     batchId,
-      //     index: i,
-      //     total,
-      //     encrypted: encrypted.encrypted,
-      //     rawBytes: chunk.byteLength,
-      //     encryptedBytes:
-      //       encrypted.data.byteLength,
-      //     base64Bytes: content.length,
-      //   },
-      // );
 
       await publishEvent({
         ndk: this.ndk,
@@ -915,10 +868,6 @@ export class NostrProvider extends ObservableV2 {
       index < 0 ||
       index >= total
     ) {
-      console.warn(
-        "[YJS] Ignoring invalid chunk:",
-        chunkTag,
-      );
       return;
     }
 
@@ -942,14 +891,7 @@ export class NostrProvider extends ObservableV2 {
     }
 
     if (batch.total !== total) {
-      console.warn(
-        "[YJS] Ignoring chunk with mismatched total",
-        {
-          batchId,
-          expected: batch.total,
-          received: total,
-        },
-      );
+
       return;
     }
 
@@ -1216,15 +1158,6 @@ export class NostrProvider extends ObservableV2 {
               initialEvents,
             );
 
-          // console.log(
-          //   "[YJS] Initial events",
-          //   {
-          //     received:
-          //       initialEvents.length,
-          //     usable:
-          //       usableInitialEvents.length,
-          //   },
-          // );
 
           const initialLocalState =
             this.yjs.encodeStateAsUpdate(
@@ -1413,10 +1346,7 @@ export class NostrProvider extends ObservableV2 {
         this._documentUpdateListener,
       );
     } catch (error) {
-      console.warn(
-        "[YJS] Failed to remove Y.Doc listener:",
-        error,
-      );
+
     }
 
     try {
@@ -1424,10 +1354,7 @@ export class NostrProvider extends ObservableV2 {
       this.subscription?.close?.();
       this.subscription?.unsubscribe?.();
     } catch (error) {
-      console.warn(
-        "[YJS] Failed to close Nostr subscription:",
-        error,
-      );
+
     }
 
     this.subscription = undefined;
