@@ -12,6 +12,9 @@ import {
 const pool = new SimplePool();
 
 const NOSTR_UPDATE_CHUNK_BYTES = 512 * 1024;
+const NOSTR_ROOM_CONTROL_EVENT_KIND = 7778;
+const DEFAULT_ROOM_MIGRATION_UPDATE_THRESHOLD = 500;
+const DEFAULT_ROOM_MIGRATION_BYTE_THRESHOLD = 2 * 1024 * 1024;
 
 const ENC_TAG_NAME = "enc";
 const ENC_AGE = "age";
@@ -207,6 +210,7 @@ async function runEncrypt(encrypt, input) {
     encrypted: result.encrypted === true,
   };
 }
+
 async function runDecrypt(
   decrypt,
   input,
@@ -240,8 +244,6 @@ async function runDecrypt(
    * decode.
    */
   if (typeof decrypt !== "function") {
-
-
     return undefined;
   }
 
@@ -328,6 +330,134 @@ async function publishEvent({
   await event.publish();
 
   return event;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Room migration                                                             */
+/* -------------------------------------------------------------------------- */
+
+function parseRoomControlEvent(event) {
+  if (event?.kind !== NOSTR_ROOM_CONTROL_EVENT_KIND) {
+    return undefined;
+  }
+
+  const actionTag = event.tags?.find(
+    (tag) =>
+      Array.isArray(tag) &&
+      tag[0] === "action",
+  );
+
+  if (actionTag?.[1] !== "deprecated") {
+    return undefined;
+  }
+
+  const roomTag = event.tags?.find(
+    (tag) =>
+      Array.isArray(tag) &&
+      tag[0] === "room",
+  );
+
+  const newRoomId = `${roomTag?.[1] ?? ""}`.trim();
+
+  if (!newRoomId) {
+    return undefined;
+  }
+
+  return {
+    action: "deprecated",
+    oldRoomId: event.tags?.find(
+      (tag) =>
+        Array.isArray(tag) &&
+        tag[0] === "e",
+    )?.[1] ?? "",
+    newRoomId,
+    eventId: event.id,
+  };
+}
+
+export async function publishRoomDeprecated({
+  ndk,
+  explicitRelayUrls,
+  secretNostrKey,
+  oldRoomId,
+  newRoomId,
+}) {
+  const event = await publishEvent({
+    ndk,
+    explicitRelayUrls,
+    secretNostrKey,
+    eventTemplate: {
+      kind: NOSTR_ROOM_CONTROL_EVENT_KIND,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [
+        ["e", oldRoomId],
+        ["room", newRoomId],
+        ["action", "deprecated"],
+      ],
+      content: JSON.stringify({
+        action: "deprecated",
+        oldRoomId,
+        newRoomId,
+      }),
+    },
+  });
+
+  return event.id;
+}
+
+export async function migrateNostrCRDTRoom({
+  ndk,
+  yjs,
+  ydoc,
+  label,
+  oldRoomId,
+  YJS_UPDATE_EVENT_KIND,
+  secretNostrKey,
+  explicitRelayUrls,
+  encrypt,
+}) {
+  if (!oldRoomId) {
+    throw new Error(
+      "[YJS] Cannot migrate room without oldRoomId",
+    );
+  }
+
+  const snapshot = toUint8Array(
+    yjs.encodeStateAsUpdate(ydoc),
+  );
+
+  if (snapshot.byteLength <= 2) {
+    throw new Error(
+      "[YJS] Cannot migrate an empty room",
+    );
+  }
+
+  const newRoomId = await createNostrCRDTRoom({
+    ndk,
+    yjs,
+    label: label || "crdtroom",
+    initialLocalState: snapshot,
+    YJS_UPDATE_EVENT_KIND,
+    secretNostrKey,
+    explicitRelayUrls,
+    encrypt,
+  });
+
+  if (!newRoomId) {
+    throw new Error(
+      "[YJS] Room migration did not produce a new room ID",
+    );
+  }
+
+  await publishRoomDeprecated({
+    ndk,
+    explicitRelayUrls,
+    secretNostrKey,
+    oldRoomId,
+    newRoomId,
+  });
+
+  return newRoomId;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -472,6 +602,13 @@ export class NostrProvider extends ObservableV2 {
       YJS_UPDATE_EVENT_KIND,
       secretNostrKey,
       explicitRelayUrls,
+      label = "crdtroom",
+      autoMigrate = true,
+      migrationUpdateThreshold =
+        DEFAULT_ROOM_MIGRATION_UPDATE_THRESHOLD,
+      migrationByteThreshold =
+        DEFAULT_ROOM_MIGRATION_BYTE_THRESHOLD,
+      onRoomDeprecated = undefined,
 
       /*
        * ONLY callbacks cross the y-ndk boundary.
@@ -504,8 +641,24 @@ export class NostrProvider extends ObservableV2 {
     this.explicitRelayUrls =
       explicitRelayUrls || [];
 
+    this.label = label;
+    this.autoMigrate = autoMigrate === true;
+    this.migrationUpdateThreshold =
+      Math.max(1, migrationUpdateThreshold);
+    this.migrationByteThreshold =
+      Math.max(1, migrationByteThreshold);
+    this.onRoomDeprecated =
+      typeof onRoomDeprecated === "function"
+        ? onRoomDeprecated
+        : undefined;
+
     this.encrypt = encrypt;
     this.decrypt = decrypt;
+
+    this.localUpdateCount = 0;
+    this.localUpdateBytes = 0;
+    this.migrationInProgress = false;
+    this.migrated = false;
 
     this.chunkBuffer = new Map();
     this.chunkBufferMaxAge = 60 * 60 * 1000;
@@ -529,10 +682,6 @@ export class NostrProvider extends ObservableV2 {
       "update",
       this._documentUpdateListener,
     );
-
-    if (!this.nostrRoomCreateEventId) {
-
-    }
   }
 
   /* ------------------------------------------------------------------------ */
@@ -551,19 +700,9 @@ export class NostrProvider extends ObservableV2 {
       encrypted,
     );
 
-    /*
-     * An encrypted event can legitimately be unavailable to this
-     * client when no decrypt() function was configured.
-     *
-     * y-ndk does not know anything about identities, recipients,
-     * age keys, or encryption configuration.
-     */
     if (update == null) {
-
-
       return undefined;
     }
-
 
     return update;
   }
@@ -576,18 +715,11 @@ export class NostrProvider extends ObservableV2 {
         const update =
           await this.decodeEvent(event);
 
-        /*
-         * undefined means this client could not decode the event.
-         *
-         * This is expected for an encrypted event when the current
-         * client has no decrypt() function configured.
-         */
         if (update == null) {
           continue;
         }
 
         if (update.byteLength === 0) {
-
           continue;
         }
 
@@ -627,6 +759,169 @@ export class NostrProvider extends ObservableV2 {
       );
 
       throw error;
+    }
+  }
+
+  async switchToRoom(newRoomId) {
+    if (
+      !newRoomId ||
+      newRoomId ===
+        this.nostrRoomCreateEventId ||
+      this.destroyed
+    ) {
+      return;
+    }
+
+    this.nostrRoomCreateEventId =
+      newRoomId;
+
+    this.localUpdateCount = 0;
+    this.localUpdateBytes = 0;
+    this.migrationInProgress = false;
+    this.migrated = false;
+
+    try {
+      for (const sub of this.subscription || []) {
+        sub?.stop?.();
+        sub?.close?.();
+        sub?.unsubscribe?.();
+      }
+    } catch (error) {
+      console.warn(
+        "[YJS] Failed to stop deprecated-room subscriptions:",
+        error,
+      );
+    }
+
+    this.subscription = undefined;
+
+    /*
+     * Start the new generation against the same Y.Doc.
+     * IndexedDB and any local offline changes therefore remain intact.
+     */
+    await this.initialize();
+  }
+
+  async processRoomControlEvent(event) {
+    const control = parseRoomControlEvent(event);
+
+    if (!control) {
+      return;
+    }
+
+    if (
+      control.oldRoomId &&
+      control.oldRoomId !==
+        this.nostrRoomCreateEventId
+    ) {
+      return;
+    }
+
+    if (this.migrated) {
+      return;
+    }
+
+    this.migrated = true;
+
+    const oldRoomId =
+      control.oldRoomId ||
+      this.nostrRoomCreateEventId;
+
+    try {
+      await this.onRoomDeprecated?.(
+        control.newRoomId,
+        oldRoomId,
+        control.eventId,
+      );
+    } catch (error) {
+      console.warn(
+        "[YJS] onRoomDeprecated callback failed:",
+        error,
+      );
+    }
+
+    if (!this.destroyed) {
+      await this.switchToRoom(
+        control.newRoomId,
+      );
+    }
+  }
+
+  async maybeMigrateRoom() {
+    if (
+      !this.autoMigrate ||
+      this.destroyed ||
+      this.migrationInProgress ||
+      this.migrated ||
+      this.pendingUpdates.length > 0
+    ) {
+      return;
+    }
+
+    if (
+      this.localUpdateCount <
+        this.migrationUpdateThreshold &&
+      this.localUpdateBytes <
+        this.migrationByteThreshold
+    ) {
+      return;
+    }
+
+    this.migrationInProgress = true;
+
+    try {
+      console.log(
+        "[YJS] Migrating large room",
+        {
+          oldRoomId:
+            this.nostrRoomCreateEventId,
+          updateCount:
+            this.localUpdateCount,
+          updateBytes:
+            this.localUpdateBytes,
+        },
+      );
+
+      const newRoomId =
+        await migrateNostrCRDTRoom({
+          ndk: this.ndk,
+          yjs: this.yjs,
+          ydoc: this.ydoc,
+          label: this.label,
+          oldRoomId:
+            this.nostrRoomCreateEventId,
+          YJS_UPDATE_EVENT_KIND:
+            this.YJS_UPDATE_EVENT_KIND,
+          secretNostrKey:
+            this.secretNostrKey,
+          explicitRelayUrls:
+            this.explicitRelayUrls,
+          encrypt: this.encrypt,
+        });
+
+      const oldRoomId =
+        this.nostrRoomCreateEventId;
+
+      this.migrated = true;
+
+      await this.onRoomDeprecated?.(
+        newRoomId,
+        oldRoomId,
+        undefined,
+      );
+
+      if (!this.destroyed) {
+        await this.switchToRoom(
+          newRoomId,
+        );
+      }
+    } catch (error) {
+      console.warn(
+        "[YJS] Room migration failed; continuing with current room:",
+        error,
+      );
+    } finally {
+      this.migrationInProgress = false;
     }
   }
 
@@ -740,8 +1035,15 @@ export class NostrProvider extends ObservableV2 {
       return;
     }
 
+    const localUpdate =
+      toUint8Array(update);
+
+    this.localUpdateCount += 1;
+    this.localUpdateBytes +=
+      localUpdate.byteLength;
+
     this.pendingUpdates.push(
-      toUint8Array(update),
+      localUpdate,
     );
 
     if (this.sendPendingTimeout) {
@@ -767,6 +1069,8 @@ export class NostrProvider extends ObservableV2 {
           await this.publishUpdates(
             updates,
           );
+
+          await this.maybeMigrateRoom();
         } catch (error) {
           console.error(
             "[YJS] Failed to publish Yjs update:",
@@ -783,7 +1087,7 @@ export class NostrProvider extends ObservableV2 {
   }
 
   /* ------------------------------------------------------------------------ */
-  /* Chunk cleanup                                                            */
+  /* Chunk cleanup                                                             */
   /* ------------------------------------------------------------------------ */
 
   cleanupChunkBuffer() {
@@ -810,6 +1114,17 @@ export class NostrProvider extends ObservableV2 {
 
   async processIncomingEvent(event) {
     if (this.destroyed) {
+      return;
+    }
+
+    if (
+      event?.kind ===
+      NOSTR_ROOM_CONTROL_EVENT_KIND
+    ) {
+      await this.processRoomControlEvent(
+        event,
+      );
+
       return;
     }
 
@@ -891,7 +1206,6 @@ export class NostrProvider extends ObservableV2 {
     }
 
     if (batch.total !== total) {
-
       return;
     }
 
@@ -979,7 +1293,6 @@ export class NostrProvider extends ObservableV2 {
       );
     }
   }
-
   /* ------------------------------------------------------------------------ */
   /* Initial history                                                          */
   /* ------------------------------------------------------------------------ */
@@ -1091,14 +1404,267 @@ export class NostrProvider extends ObservableV2 {
     }
 
     try {
+      let eoseCount = 0;
       let eoseSeen = false;
       const initialEvents = [];
+      const initialEventIds = new Set();
 
-      const sub =
+      const subscriptions = [];
+
+      const handleEvent = (event) => {
+        if (this.destroyed) {
+          return;
+        }
+
+        if (
+          event?.kind ===
+          NOSTR_ROOM_CONTROL_EVENT_KIND
+        ) {
+          void this.processRoomControlEvent(
+            event,
+          );
+
+          return;
+        }
+
+        if (
+          event?.id &&
+          initialEventIds.has(event.id)
+        ) {
+          return;
+        }
+
+        if (event?.id) {
+          initialEventIds.add(event.id);
+        }
+
+        if (!eoseSeen) {
+          initialEvents.push(event);
+        } else {
+          void this.processIncomingEvent(
+            event,
+          );
+        }
+      };
+
+      const handleEvents = (events) => {
+        for (const event of events || []) {
+          handleEvent(event);
+        }
+      };
+
+      const handleEose = async () => {
+        if (this.destroyed) {
+          return;
+        }
+
+        eoseCount += 1;
+
+        /*
+         * We use two subscriptions:
+         *
+         * 1. ids = current room creation event
+         * 2. #e = current room creation event
+         *
+         * Wait until both have reached EOSE before reconstructing
+         * the initial state.
+         */
+        if (
+          eoseCount < 2 ||
+          eoseSeen
+        ) {
+          return;
+        }
+
+        eoseSeen = true;
+
+        const usableInitialEvents =
+          this.updateFromInitialEvents(
+            initialEvents,
+          );
+
+        const initialLocalState =
+          this.yjs.encodeStateAsUpdate(
+            this.ydoc,
+          );
+
+        const initialLocalStateVector =
+          this.yjs.encodeStateVectorFromUpdate(
+            initialLocalState,
+          );
+
+        const deleteSetOnlyUpdate =
+          this.yjs.diffUpdate(
+            initialLocalState,
+            initialLocalStateVector,
+          );
+
+        const oldSnapshot =
+          this.yjs.snapshot(
+            this.ydoc,
+          );
+
+        let update;
+
+        if (
+          usableInitialEvents.length >
+          0
+        ) {
+          try {
+            update =
+              await this.updateFromEvents(
+                usableInitialEvents,
+              );
+          } catch (error) {
+            if (!this.destroyed) {
+              console.error(
+                "[YJS] Failed to construct initial Yjs update:",
+                error,
+              );
+            }
+
+            return;
+          }
+
+          if (
+            update !== undefined &&
+            !this.destroyed
+          ) {
+            this.yjs.applyUpdate(
+              this.ydoc,
+              update,
+              this,
+            );
+          }
+        }
+
+        if (
+          usableInitialEvents.length ===
+            0 ||
+          update === undefined
+        ) {
+          if (this.destroyed) {
+            return;
+          }
+
+          const localUpdate =
+            this.yjs.encodeStateAsUpdate(
+              this.ydoc,
+            );
+
+          if (localUpdate.length > 2) {
+            try {
+              await this.publishUpdates([
+                localUpdate,
+              ]);
+            } catch (error) {
+              if (!this.destroyed) {
+                console.error(
+                  "[YJS] Failed to publish initial Yjs update:",
+                  error,
+                );
+              }
+            }
+          }
+
+          return;
+        }
+
+        if (this.destroyed) {
+          return;
+        }
+
+        const remoteStateVector =
+          this.yjs.encodeStateVectorFromUpdate(
+            update,
+          );
+
+        const missingOnWire =
+          this.yjs.diffUpdate(
+            initialLocalState,
+            remoteStateVector,
+          );
+
+        if (
+          arrayBuffersAreEqual(
+            deleteSetOnlyUpdate.buffer,
+            missingOnWire.buffer,
+          )
+        ) {
+          const serverDoc =
+            new this.yjs.Doc();
+
+          this.yjs.applyUpdate(
+            serverDoc,
+            update,
+          );
+
+          const serverSnapshot =
+            this.yjs.snapshot(
+              serverDoc,
+            );
+
+          snapshotContainsAllDeletes(
+            serverSnapshot,
+            oldSnapshot,
+          );
+
+          serverDoc.destroy();
+        }
+
+        if (
+          missingOnWire.length > 2 &&
+          !this.destroyed
+        ) {
+          try {
+            await this.publishUpdates([
+              missingOnWire,
+            ]);
+          } catch (error) {
+            if (!this.destroyed) {
+              console.error(
+                "[YJS] Failed to publish missing Yjs update:",
+                error,
+              );
+            }
+          }
+        }
+      };
+
+      /*
+       * The creation event is the root of a room generation.
+       *
+       * A migration creates a new room by publishing a fresh creation
+       * event containing a compact snapshot. Therefore the provider
+       * must subscribe to the creation event itself, not just #e
+       * updates referring to it.
+       */
+      const rootSubscription =
         this.ndk.subscribe(
           {
             kinds: [
               this.YJS_UPDATE_EVENT_KIND,
+              NOSTR_ROOM_CONTROL_EVENT_KIND,
+            ],
+            ids: [
+              this.nostrRoomCreateEventId,
+            ],
+          },
+          {
+            closeOnEose: false,
+          },
+        );
+
+      /*
+       * Normal incremental updates and deprecation controls point
+       * back to the room creation event with an e tag.
+       */
+      const updateSubscription =
+        this.ndk.subscribe(
+          {
+            kinds: [
+              this.YJS_UPDATE_EVENT_KIND,
+              NOSTR_ROOM_CONTROL_EVENT_KIND,
             ],
             "#e": [
               this.nostrRoomCreateEventId,
@@ -1109,204 +1675,30 @@ export class NostrProvider extends ObservableV2 {
           },
         );
 
-      this.subscription = sub;
-
-      sub.on(
-        "event",
-        (event) => {
-          if (this.destroyed) {
-            return;
-          }
-
-          if (!eoseSeen) {
-            initialEvents.push(event);
-          } else {
-            void this.processIncomingEvent(
-              event,
-            );
-          }
-        },
+      subscriptions.push(
+        rootSubscription,
+        updateSubscription,
       );
 
-      sub.on(
-        "events",
-        (events) => {
-          if (
-            this.destroyed ||
-            !eoseSeen
-          ) {
-            return;
-          }
+      this.subscription =
+        subscriptions;
 
-          this.processIncomingEvents(
-            events,
-          );
-        },
-      );
+      for (const sub of subscriptions) {
+        sub.on(
+          "event",
+          handleEvent,
+        );
 
-      sub.on(
-        "eose",
-        async () => {
-          if (this.destroyed) {
-            return;
-          }
+        sub.on(
+          "events",
+          handleEvents,
+        );
 
-          eoseSeen = true;
-
-          const usableInitialEvents =
-            this.updateFromInitialEvents(
-              initialEvents,
-            );
-
-
-          const initialLocalState =
-            this.yjs.encodeStateAsUpdate(
-              this.ydoc,
-            );
-
-          const initialLocalStateVector =
-            this.yjs.encodeStateVectorFromUpdate(
-              initialLocalState,
-            );
-
-          const deleteSetOnlyUpdate =
-            this.yjs.diffUpdate(
-              initialLocalState,
-              initialLocalStateVector,
-            );
-
-          const oldSnapshot =
-            this.yjs.snapshot(
-              this.ydoc,
-            );
-
-          let update;
-
-          if (
-            usableInitialEvents.length >
-            0
-          ) {
-            try {
-              update =
-                await this.updateFromEvents(
-                  usableInitialEvents,
-                );
-            } catch (error) {
-              if (!this.destroyed) {
-                console.error(
-                  "[YJS] Failed to construct initial Yjs update:",
-                  error,
-                );
-              }
-
-              return;
-            }
-
-            if (
-              update !== undefined &&
-              !this.destroyed
-            ) {
-              this.yjs.applyUpdate(
-                this.ydoc,
-                update,
-                this,
-              );
-            }
-          }
-
-          if (
-            usableInitialEvents.length ===
-              0 ||
-            update === undefined
-          ) {
-            if (this.destroyed) {
-              return;
-            }
-
-            const localUpdate =
-              this.yjs.encodeStateAsUpdate(
-                this.ydoc,
-              );
-
-            if (localUpdate.length > 2) {
-              try {
-                await this.publishUpdates([
-                  localUpdate,
-                ]);
-              } catch (error) {
-                if (!this.destroyed) {
-                  console.error(
-                    "[YJS] Failed to publish initial Yjs update:",
-                    error,
-                  );
-                }
-              }
-            }
-
-            return;
-          }
-
-          if (this.destroyed) {
-            return;
-          }
-
-          const remoteStateVector =
-            this.yjs.encodeStateVectorFromUpdate(
-              update,
-            );
-
-          const missingOnWire =
-            this.yjs.diffUpdate(
-              initialLocalState,
-              remoteStateVector,
-            );
-
-          if (
-            arrayBuffersAreEqual(
-              deleteSetOnlyUpdate.buffer,
-              missingOnWire.buffer,
-            )
-          ) {
-            const serverDoc =
-              new this.yjs.Doc();
-
-            this.yjs.applyUpdate(
-              serverDoc,
-              update,
-            );
-
-            const serverSnapshot =
-              this.yjs.snapshot(
-                serverDoc,
-              );
-
-            snapshotContainsAllDeletes(
-              serverSnapshot,
-              oldSnapshot,
-            );
-
-            serverDoc.destroy();
-          }
-
-          if (
-            missingOnWire.length > 2 &&
-            !this.destroyed
-          ) {
-            try {
-              await this.publishUpdates([
-                missingOnWire,
-              ]);
-            } catch (error) {
-              if (!this.destroyed) {
-                console.error(
-                  "[YJS] Failed to publish missing Yjs update:",
-                  error,
-                );
-              }
-            }
-          }
-        },
-      );
+        sub.on(
+          "eose",
+          handleEose,
+        );
+      }
     } catch (error) {
       if (!this.destroyed) {
         console.error(
@@ -1346,15 +1738,17 @@ export class NostrProvider extends ObservableV2 {
         this._documentUpdateListener,
       );
     } catch (error) {
-
+      // Ignore.
     }
 
     try {
-      this.subscription?.stop?.();
-      this.subscription?.close?.();
-      this.subscription?.unsubscribe?.();
+      for (const sub of this.subscription || []) {
+        sub?.stop?.();
+        sub?.close?.();
+        sub?.unsubscribe?.();
+      }
     } catch (error) {
-
+      // Ignore.
     }
 
     this.subscription = undefined;
