@@ -725,13 +725,13 @@ export class NostrProvider extends ObservableV2 {
 
         updates.push(update);
       } catch (error) {
-        console.error(
-          "[YJS] Failed to decode/decrypt event:",
-          {
-            eventId: event?.id,
-            error,
-          },
-        );
+        // console.error(
+        //   "[YJS] Failed to decode/decrypt event:",
+        //   {
+        //     eventId: event?.id,
+        //     error,
+        //   },
+        // );
       }
     }
 
@@ -1225,13 +1225,13 @@ export class NostrProvider extends ObservableV2 {
         batch.chunks[index] = update;
         batch.received += 1;
       } catch (error) {
-        console.error(
-          "[YJS] Failed to decode/decrypt incoming chunk:",
-          {
-            eventId: event?.id,
-            error,
-          },
-        );
+        // console.error(
+        //   "[YJS] Failed to decode/decrypt incoming chunk:",
+        //   {
+        //     eventId: event?.id,
+        //     error,
+        //   },
+        // );
 
         return;
       }
